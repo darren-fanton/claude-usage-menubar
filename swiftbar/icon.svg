@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <g transform="translate(50,50)" fill="black">
+    <!-- 8 teardrop spokes (4 ellipses at 0, 45, 90, 135 degrees) -->
+    <ellipse cx="0" cy="0" rx="7"  ry="46" />
+    <ellipse cx="0" cy="0" rx="7"  ry="46" transform="rotate(45)" />
+    <ellipse cx="0" cy="0" rx="7"  ry="46" transform="rotate(90)" />
+    <ellipse cx="0" cy="0" rx="7"  ry="46" transform="rotate(135)" />
+    <!-- center disc to thicken the hub -->
+    <circle cx="0" cy="0" r="10" />
+  </g>
+</svg>
