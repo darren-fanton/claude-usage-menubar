@@ -1,8 +1,14 @@
 (() => {
   const ENDPOINT = "http://localhost:7823/usage";
   const POLL_MS = 60_000;
+  // Bump this string whenever the scraper changes so it's obvious in the console
+  // which version is actually loaded (i.e. whether the extension was reloaded).
+  const VERSION = "aria-2";
+  console.log(`[claude-usage] content script loaded (${VERSION})`, location.href);
 
-  const RESET_SELECTOR = "span.whitespace-nowrap.text-footnote.text-secondary";
+  // The usage bars expose `aria-valuenow` for the percentage. claude.ai's
+  // redesign dropped the explicit role="progressbar", so key off the aria attr.
+  const BAR_SELECTOR = "[aria-valuenow]";
 
   // Map of weekly row labels -> JSON keys
   const WEEKLY_KEY_MAP = {
@@ -10,47 +16,59 @@
     "sonnet": "sonnet",
     "design": "design",
     "opus": "opus",
+    "fable": "fable",
   };
 
   function findSectionByHeading(headingText) {
-    const headings = Array.from(document.querySelectorAll("h3"));
+    // Match across heading levels -- the redesign no longer guarantees <h3>.
+    const headings = Array.from(document.querySelectorAll("h1,h2,h3,h4"));
     const needle = headingText.toLowerCase();
-    // Use startsWith so we tolerate trailing badges like "Plan usage limitsMax (5x)".
+    // Use startsWith so we tolerate trailing badges like "Plan usage limitsMax (20x)".
     const match = headings.find((h) =>
       h.textContent.trim().toLowerCase().startsWith(needle)
     );
     if (!match) return null;
-    // Walk up to a reasonable container that holds the progress bars.
+    // Walk up to a reasonable container that holds the usage bars.
     let node = match.parentElement;
     for (let i = 0; i < 6 && node; i++) {
-      if (node.querySelector('[role="progressbar"]')) return node;
+      if (node.querySelector(BAR_SELECTOR)) return node;
       node = node.parentElement;
     }
     return null;
   }
 
   function readBar(barEl) {
-    const pctRaw = barEl.getAttribute("aria-valuenow");
-    const pct = pctRaw == null ? null : parseInt(pctRaw, 10);
+    // aria-valuenow is the percentage when valuemax is 100 (the usual case);
+    // normalize against valuemax defensively in case it isn't.
+    const now = parseFloat(barEl.getAttribute("aria-valuenow"));
+    const max = parseFloat(barEl.getAttribute("aria-valuemax"));
+    let pct = null;
+    if (Number.isFinite(now)) {
+      pct =
+        Number.isFinite(max) && max > 0
+          ? Math.round((now / max) * 100)
+          : Math.round(now);
+    }
 
-    // Look for a nearby reset label. Among spans matching the reset selector,
-    // prefer one whose text mentions "reset" (case-insensitive) so we don't
-    // accidentally grab the "39% used" label that shares the same classes.
+    // Find a nearby "Resets …" label. class names on claude.ai churn, so match
+    // by text content rather than a fragile selector: walk up from the bar and
+    // grab the nearest leaf element whose text starts with "Resets".
     let reset = null;
     let scope = barEl.parentElement;
-    for (let i = 0; i < 5 && scope && !reset; i++) {
-      const spans = Array.from(scope.querySelectorAll(RESET_SELECTOR));
-      const resetSpan = spans.find((s) => /reset/i.test(s.textContent));
-      if (resetSpan) reset = resetSpan.textContent.trim();
+    for (let i = 0; i < 6 && scope && !reset; i++) {
+      const el = Array.from(scope.querySelectorAll("*")).find(
+        (x) => x.children.length === 0 && /^resets\b/i.test(x.textContent.trim())
+      );
+      if (el) reset = el.textContent.trim();
       scope = scope.parentElement;
     }
-    return { pct: Number.isFinite(pct) ? pct : null, reset };
+    return { pct, reset };
   }
 
   function readSession() {
     const section = findSectionByHeading("Plan usage limits");
     if (!section) return null;
-    const bar = section.querySelector('[role="progressbar"]');
+    const bar = section.querySelector(BAR_SELECTOR);
     if (!bar) return null;
     return readBar(bar);
   }
@@ -58,7 +76,7 @@
   function readWeekly() {
     const section = findSectionByHeading("Weekly limits");
     if (!section) return null;
-    const bars = Array.from(section.querySelectorAll('[role="progressbar"]'));
+    const bars = Array.from(section.querySelectorAll(BAR_SELECTOR));
     const out = {};
     for (const bar of bars) {
       // Find the label for this row by walking up to a row container.
@@ -84,18 +102,36 @@
     return Object.keys(out).length ? out : null;
   }
 
+  // Track the last distinct scrape so `updatedAt` reflects when the usage data
+  // actually changed, not merely when we last polled. claude.ai is a SPA: an
+  // idle/stale tab keeps the same frozen numbers in the DOM, and re-stamping a
+  // fresh timestamp on every poll makes the menu bar perpetually say "just now"
+  // while the reset countdown (anchored to updatedAt) slides forward and never
+  // expires. Reusing the prior timestamp on unchanged data keeps the reset time
+  // anchored to when the data was genuinely captured, so staleness surfaces.
+  let lastSig = null;
+  let lastUpdatedAt = 0;
+
   function buildPayload() {
     const session = readSession();
     const weekly = readWeekly();
     if (!session && !weekly) return null;
     // If a session bar is on the page but no reset countdown is in scope,
     // this tab is on a different account or in a transitional render —
-    // skip rather than overwrite good data from another tab.
-    if (session && !session.reset) return null;
+    // skip rather than overwrite good data from another tab. EXCEPTION: a
+    // genuinely 0%-used session (freshly reset) shows no countdown yet, and we
+    // still want to report it so the menu bar updates to 0% instead of showing
+    // the prior session's stale numbers.
+    if (session && !session.reset && session.pct !== 0) return null;
+    const sig = JSON.stringify({ session, weekly });
+    if (sig !== lastSig) {
+      lastSig = sig;
+      lastUpdatedAt = Date.now();
+    }
     return {
       session: session || null,
       weekly: weekly || {},
-      updatedAt: Date.now(),
+      updatedAt: lastUpdatedAt,
     };
   }
 
@@ -115,8 +151,9 @@
         body: JSON.stringify(payload),
       });
       lastSent = now;
+      console.log("[claude-usage] sent", payload.session, payload.weekly);
     } catch (e) {
-      // Server likely not running; ignore.
+      console.warn("[claude-usage] POST failed", e);
     } finally {
       inFlight = false;
     }
