@@ -3,7 +3,7 @@
   const POLL_MS = 60_000;
   // Bump this string whenever the scraper changes so it's obvious in the console
   // which version is actually loaded (i.e. whether the extension was reloaded).
-  const VERSION = "aria-2";
+  const VERSION = "aria-3";
   console.log(`[claude-usage] content script loaded (${VERSION})`, location.href);
 
   // The usage bars expose `aria-valuenow` for the percentage. claude.ai's
@@ -163,7 +163,20 @@
   send(true);
   setInterval(() => send(true), POLL_MS);
 
-  // DOM mutations -> debounced send
-  const obs = new MutationObserver(() => send(false));
-  obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+  // DOM mutations -> debounced send. claude.ai is a busy SPA, so the observer
+  // fires constantly; invoking send() (which re-scans the DOM) on every batch is
+  // wasteful. Coalesce each burst into a single deferred scan with a trailing
+  // timer: while a scan is already queued, further mutations are a near-free
+  // early return. We also drop characterData (text-level) tracking -- it's the
+  // most expensive mode to run across the whole subtree, and the 60s poll above
+  // already backstops anything the coarser childList signal misses.
+  let debounceTimer = null;
+  const obs = new MutationObserver(() => {
+    if (debounceTimer) return; // a scan is already queued for this burst
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      send(false);
+    }, 1_000);
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
 })();
