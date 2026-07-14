@@ -9,9 +9,11 @@
 # <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 # refreshOnOpen intentionally omitted: it makes SwiftBar re-run this whole script
-# (curl + ~24 image builds) synchronously before drawing the dropdown, causing a
+# (curl + ~19 image builds) synchronously before drawing the dropdown, causing a
 # multi-second lag on every click. Without it the menu opens instantly from the
-# last background refresh (data is at most one 30s cycle stale).
+# last background refresh (data is at most one 60s cycle stale). The extension
+# only POSTs fresh data every 60s, so refreshing faster than that is wasted work
+# -- hence the 60s filename interval.
 
 # SwiftBar runs plugins with a minimal PATH; add Homebrew so `magick`, `jq`,
 # and other tools installed via brew are discoverable.
@@ -19,15 +21,17 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # --- Fast-open cache ---
 # SwiftBar re-runs this script when the dropdown is opened, and a full render
-# (curl + ~13 vector-image builds) takes ~0.8s, so the menu lagged on every click.
-# Fix: render at most once per CACHE_MAX_AGE seconds. A run whose cache is still
-# fresh just replays the cached output (~5ms => instant open); only the periodic
-# 30s SwiftBar refresh (whose cache has aged out) pays for a real render. All
-# output is captured to the cache via an fd redirect + EXIT trap, so every exit
-# path (including the early "no data" exits below) finalizes the cache and still
-# writes the menu to SwiftBar on the saved stdout (fd 3).
+# (curl + vector-image builds) takes a fraction of a second, so the menu lagged
+# on every click. Fix: render at most once per CACHE_MAX_AGE seconds. A run whose
+# cache is still fresh just replays the cached output (~5ms => instant open); only
+# the periodic 60s SwiftBar refresh (whose cache has aged out) pays for a real
+# render. AGE is just under the 60s refresh interval so a dropdown-open between
+# background refreshes always replays instantly. All output is captured to the
+# cache via an fd redirect + EXIT trap, so every exit path (including the early
+# "no data" exits below) finalizes the cache and still writes the menu to SwiftBar
+# on the saved stdout (fd 3).
 CACHE="$HOME/.cache/claude-usage/menu.txt"
-CACHE_MAX_AGE=25
+CACHE_MAX_AGE=55
 if [ -f "$CACHE" ]; then
   age=$(( $(date +%s) - $(stat -f %m "$CACHE" 2>/dev/null || echo 0) ))
   if [ "$age" -ge 0 ] && [ "$age" -lt "$CACHE_MAX_AGE" ]; then
@@ -40,47 +44,88 @@ CACHE_TMP="$CACHE.$$"
 exec 3>&1 >"$CACHE_TMP"
 trap 'mv -f "$CACHE_TMP" "$CACHE" 2>/dev/null; cat "$CACHE" >&3 2>/dev/null' EXIT
 
+# --- Image memoization ---
+# Every render used to rebuild ~19 vector images from scratch (each an
+# `rsvg-convert | base64` pipeline), even though the section pills and most bars
+# are byte-for-byte identical cycle to cycle. Memoize each generated image on
+# disk keyed by the inputs that determine it, so a steady state spawns ~0
+# rsvg-convert processes instead of 19. The dir is versioned so a change to the
+# image-drawing code (bump IMG_V) invalidates every stale cached image at once.
+IMG_V=1
+IMGCACHE="$HOME/.cache/claude-usage/img/v$IMG_V"
+mkdir -p "$IMGCACHE"
+# Reset-countdown strings change each minute, so their images accumulate; evict
+# anything older than a day. One find per real render is negligible next to the
+# ~19 rsvg-convert calls the cache removes.
+find "$IMGCACHE" -type f -mtime +1 -delete 2>/dev/null
+
 ENDPOINT="http://localhost:7823/usage"
 
 JSON=$(curl -fsS --max-time 2 "$ENDPOINT" 2>/dev/null)
 
-parse() {
-  local path="$1"
+# Extract every field we need in ONE pass. Previously each field shelled out to
+# its own `jq` (16 subprocesses per render); now a single jq (or python fallback)
+# emits all values, one per line in a fixed order, with a blank line for any
+# missing/null field so the read block below stays aligned.
+read_fields() {
   if command -v jq >/dev/null 2>&1; then
-    echo "$JSON" | jq -r "$path // empty" 2>/dev/null
+    printf '%s' "$JSON" | jq -r '
+      [ .session.pct, .session.reset,
+        .weekly.allModels.pct, .weekly.allModels.reset,
+        .weekly.sonnet.pct, .weekly.sonnet.reset,
+        .weekly.design.pct, .weekly.design.reset,
+        .weekly.opus.pct, .weekly.opus.reset,
+        .weekly.fable.pct,
+        .cost.totalUSD, .cost.perModel.opus, .cost.perModel.sonnet, .cost.perModel.haiku,
+        .updatedAt
+      ] | map(if . == null then "" else . end) | .[]' 2>/dev/null
   else
-    echo "$JSON" | python3 -c "
+    printf '%s' "$JSON" | python3 -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read() or '{}')
-    p = '$path'.strip().lstrip('.')
-    cur = d
-    for part in [x for x in p.split('.') if x]:
-        cur = cur.get(part) if isinstance(cur, dict) else None
-        if cur is None: break
-    print('' if cur is None else cur)
 except Exception:
-    print('')
+    d = {}
+def g(*ks):
+    cur = d
+    for k in ks:
+        cur = cur.get(k) if isinstance(cur, dict) else None
+        if cur is None: return ''
+    return cur
+rows = [
+    g('session','pct'), g('session','reset'),
+    g('weekly','allModels','pct'), g('weekly','allModels','reset'),
+    g('weekly','sonnet','pct'), g('weekly','sonnet','reset'),
+    g('weekly','design','pct'), g('weekly','design','reset'),
+    g('weekly','opus','pct'), g('weekly','opus','reset'),
+    g('weekly','fable','pct'),
+    g('cost','totalUSD'), g('cost','perModel','opus'), g('cost','perModel','sonnet'), g('cost','perModel','haiku'),
+    g('updatedAt'),
+]
+for r in rows:
+    print('' if r is None else r)
 " 2>/dev/null
   fi
 }
 
-SESSION_PCT=$(parse '.session.pct')
-SESSION_RESET=$(parse '.session.reset')
-WEEKLY_ALL_PCT=$(parse '.weekly.allModels.pct')
-WEEKLY_ALL_RESET=$(parse '.weekly.allModels.reset')
-WEEKLY_SONNET_PCT=$(parse '.weekly.sonnet.pct')
-WEEKLY_SONNET_RESET=$(parse '.weekly.sonnet.reset')
-WEEKLY_DESIGN_PCT=$(parse '.weekly.design.pct')
-WEEKLY_DESIGN_RESET=$(parse '.weekly.design.reset')
-WEEKLY_OPUS_PCT=$(parse '.weekly.opus.pct')
-WEEKLY_OPUS_RESET=$(parse '.weekly.opus.reset')
-WEEKLY_FABLE_PCT=$(parse '.weekly.fable.pct')
-COST_TOTAL=$(parse '.cost.totalUSD')
-COST_OPUS=$(parse '.cost.perModel.opus')
-COST_SONNET=$(parse '.cost.perModel.sonnet')
-COST_HAIKU=$(parse '.cost.perModel.haiku')
-UPDATED_AT=$(parse '.updatedAt')
+{
+  IFS= read -r SESSION_PCT
+  IFS= read -r SESSION_RESET
+  IFS= read -r WEEKLY_ALL_PCT
+  IFS= read -r WEEKLY_ALL_RESET
+  IFS= read -r WEEKLY_SONNET_PCT
+  IFS= read -r WEEKLY_SONNET_RESET
+  IFS= read -r WEEKLY_DESIGN_PCT
+  IFS= read -r WEEKLY_DESIGN_RESET
+  IFS= read -r WEEKLY_OPUS_PCT
+  IFS= read -r WEEKLY_OPUS_RESET
+  IFS= read -r WEEKLY_FABLE_PCT
+  IFS= read -r COST_TOTAL
+  IFS= read -r COST_OPUS
+  IFS= read -r COST_SONNET
+  IFS= read -r COST_HAIKU
+  IFS= read -r UPDATED_AT
+} < <(read_fields)
 
 # Format a number as $XX.XX (or "-" if empty).
 fmt_usd() {
@@ -258,7 +303,8 @@ generate_pie_b64() {
   # Output is a vector PDF (via rsvg-convert) with a 16.5x16.5 pt MediaBox.
   # NSImage rasterizes PDF natively at full retina resolution -- the same
   # technique macOS apps like Focus use for crisp menu bar icons.
-  local pct=$1 svg
+  local pct=$1 svg _f="$IMGCACHE/pie-$1"
+  [ -f "$_f" ] && { cat "$_f"; return; }
   if [ "$pct" -le 0 ]; then
     svg='<svg xmlns="http://www.w3.org/2000/svg" width="16.5pt" height="16.5pt" viewBox="0 0 100 100">
       <circle cx="50" cy="50" r="42" fill="none" stroke="black" stroke-width="6"/>
@@ -278,30 +324,32 @@ generate_pie_b64() {
       <path d="M 50,20 A 30,30 0 '$large',1 '$bx','$by' L 50,50 Z" fill="black"/>
     </svg>'
   fi
-  if command -v rsvg-convert >/dev/null 2>&1; then
+  { if command -v rsvg-convert >/dev/null 2>&1; then
     echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
   else
     # Fallback: rasterize at 14x14 if librsvg isn't installed.
     echo "$svg" \
       | magick -background none -density 800 svg:- -filter Lanczos -resize 14x14 png:- 2>/dev/null \
       | base64 | tr -d '\n'
-  fi
+  fi ; } | tee "$_f"
 }
 
 # Dash icon shown when the session has reset since the last data scrape,
 # signalling that the displayed numbers are stale and the user should click
 # to refresh.
 generate_dash_b64() {
+  local _f="$IMGCACHE/dash"
+  [ -f "$_f" ] && { cat "$_f"; return; }
   local svg='<svg xmlns="http://www.w3.org/2000/svg" width="16.5pt" height="16.5pt" viewBox="0 0 100 100">
     <rect x="20" y="45" width="60" height="10" rx="3" fill="black"/>
   </svg>'
-  if command -v rsvg-convert >/dev/null 2>&1; then
+  { if command -v rsvg-convert >/dev/null 2>&1; then
     echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
   else
     echo "$svg" \
       | magick -background none -density 800 svg:- -filter Lanczos -resize 14x14 png:- 2>/dev/null \
       | base64 | tr -d '\n'
-  fi
+  fi ; } | tee "$_f"
 }
 
 # Render a colored "pill" title image (rounded rectangle + white label) for a
@@ -310,6 +358,8 @@ generate_dash_b64() {
 #   $1 = label text, $2 = background hex (e.g. "#3b82f6")
 generate_label_b64() {
   local text="$1" bg="$2" len w
+  local _f="$IMGCACHE/label-${bg//[^[:alnum:]]/_}-${text//[^[:alnum:]]/_}"
+  [ -f "$_f" ] && { cat "$_f"; return; }
   len=${#text}
   # ~13 user-units per bold char + 24 units of horizontal padding.
   w=$(( len * 13 + 24 ))
@@ -333,13 +383,13 @@ generate_label_b64() {
     <rect x="0" y="'"$padT"'" width="'"$w"'" height="'"$body"'" rx="'"$rx"'" fill="'"$bg"'"/>
     <text x="'"$((w/2))"'" y="'"$ty"'" font-family="Helvetica" font-size="18" font-weight="bold" fill="#ffffff" text-anchor="middle">'"$text"'</text>
   </svg>'
-  if command -v rsvg-convert >/dev/null 2>&1; then
+  { if command -v rsvg-convert >/dev/null 2>&1; then
     echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
   else
     echo "$svg" \
       | magick -background none -density 800 svg:- -filter Lanczos -resize x36 png:- 2>/dev/null \
       | base64 | tr -d '\n'
-  fi
+  fi ; } | tee "$_f"
 }
 
 # Render a horizontal progress bar image: a rounded track (same hue at low opacity
@@ -353,6 +403,8 @@ generate_bar_b64() {
   [ -z "$pct" ] && pct=0
   case "$pct" in *[!0-9]*) pct=0;; esac
   [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+  local _f="$IMGCACHE/bar-${fill//[^[:alnum:]]/_}-$pct"
+  [ -f "$_f" ] && { cat "$_f"; return; }
   # Height tuned to sit alongside the row's text label. W/H set the aspect; hpt is
   # the on-screen bar height in pt (wpt scales to keep the ~150pt width).
   local W=200 H=12 fw wpt hpt
@@ -363,13 +415,13 @@ generate_bar_b64() {
     <rect x="0" y="0" width="'"$W"'" height="'"$H"'" rx="6" fill="'"$fill"'" fill-opacity="0.22"/>
     <rect x="0" y="0" width="'"$fw"'" height="'"$H"'" rx="6" fill="'"$fill"'"/>
   </svg>'
-  if command -v rsvg-convert >/dev/null 2>&1; then
+  { if command -v rsvg-convert >/dev/null 2>&1; then
     echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
   else
     echo "$svg" \
       | magick -background none -density 800 svg:- -filter Lanczos -resize x24 png:- 2>/dev/null \
       | base64 | tr -d '\n'
-  fi
+  fi ; } | tee "$_f"
 }
 
 # Render a reset time/date row ("↻ 1h 45m ( 4:49 PM )") as a grey image so we can
@@ -379,6 +431,8 @@ generate_bar_b64() {
 #   $1 = the full row text (glyph + times)
 generate_reset_b64() {
   local text="$1"
+  local _f="$IMGCACHE/reset-${text//[^[:alnum:]]/_}"
+  [ -f "$_f" ] && { cat "$_f"; return; }
   # Split the leading "↻ " glyph from the time text so the glyph can be drawn a bit
   # larger than the (smaller) time text.
   # Reload icon = the real ↻ (U+21BB) glyph from the macOS SF system font, but
@@ -405,13 +459,13 @@ generate_reset_b64() {
     '"$glyph"'
     <text x="'"$xrest"'" y="11.5" font-family="Helvetica" font-size="13" fill="#8a8a8a">'"$esc"'</text>
   </svg>'
-  if command -v rsvg-convert >/dev/null 2>&1; then
+  { if command -v rsvg-convert >/dev/null 2>&1; then
     echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
   else
     echo "$svg" \
       | magick -background none -density 800 svg:- -filter Lanczos -resize x52 png:- 2>/dev/null \
       | base64 | tr -d '\n'
-  fi
+  fi ; } | tee "$_f"
 }
 
 # Has the session reset time passed since we last scraped? If so, the cached

@@ -99,8 +99,8 @@ PLUGIN_DIR="$HOME/Library/Application Support/SwiftBar/Plugins"   # default
 mkdir -p "$PLUGIN_DIR"
 
 # 2. Symlink the script (so edits propagate without copying)
-ln -sf "$HOME/Projects/claude-usage-menubar/swiftbar/claude-usage.30s.sh" \
-       "$PLUGIN_DIR/claude-usage.30s.sh"
+ln -sf "$HOME/Projects/claude-usage-menubar/swiftbar/claude-usage.60s.sh" \
+       "$PLUGIN_DIR/claude-usage.60s.sh"
 
 # 3. Refresh SwiftBar (menu bar → SwiftBar → Refresh All)
 ```
@@ -139,7 +139,7 @@ claude-usage-menubar/
 │   ├── server.js
 │   └── io.claude-usage.server.plist   # template — see install steps
 └── swiftbar/
-    └── claude-usage.30s.sh
+    └── claude-usage.60s.sh
 ```
 
 ---

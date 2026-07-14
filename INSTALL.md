@@ -127,8 +127,8 @@ PLUGIN_DIR="$HOME/Library/Application Support/SwiftBar/Plugins"   # default
 mkdir -p "$PLUGIN_DIR"
 
 # Symlink so future edits to the project propagate without copying
-ln -sf "$PROJECT_DIR/swiftbar/claude-usage.30s.sh" \
-       "$PLUGIN_DIR/claude-usage.30s.sh"
+ln -sf "$PROJECT_DIR/swiftbar/claude-usage.60s.sh" \
+       "$PLUGIN_DIR/claude-usage.60s.sh"
 
 # Refresh: SwiftBar menu bar icon → Refresh All
 ```
@@ -178,7 +178,7 @@ claude-usage-menubar/
 │   ├── io.claude-usage.server.plist      # template — see Step 1
 │   └── io.claude-usage.refresh.plist     # template — see Step 2
 └── swiftbar/
-    ├── claude-usage.30s.sh               # the menu bar plugin
+    ├── claude-usage.60s.sh               # the menu bar plugin
     ├── refresh-usage.sh                  # auto-reload helper (→ ~/.local/bin/)
     ├── icon.svg
     ├── claude-logo-source.png
@@ -202,7 +202,7 @@ tail -5 ~/Library/Logs/claude-usage-server.log
 tail -10 ~/Library/Logs/claude-usage-refresh.log
 
 # 5. SwiftBar plugin renders without errors
-bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.30s.sh" | head -20
+bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.60s.sh" | head -20
 ```
 
 ## Troubleshooting
