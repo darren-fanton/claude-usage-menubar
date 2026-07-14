@@ -8,11 +8,37 @@
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
 # <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
-# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>
+# refreshOnOpen intentionally omitted: it makes SwiftBar re-run this whole script
+# (curl + ~24 image builds) synchronously before drawing the dropdown, causing a
+# multi-second lag on every click. Without it the menu opens instantly from the
+# last background refresh (data is at most one 30s cycle stale).
 
 # SwiftBar runs plugins with a minimal PATH; add Homebrew so `magick`, `jq`,
 # and other tools installed via brew are discoverable.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# --- Fast-open cache ---
+# SwiftBar re-runs this script when the dropdown is opened, and a full render
+# (curl + ~13 vector-image builds) takes ~0.8s, so the menu lagged on every click.
+# Fix: render at most once per CACHE_MAX_AGE seconds. A run whose cache is still
+# fresh just replays the cached output (~5ms => instant open); only the periodic
+# 30s SwiftBar refresh (whose cache has aged out) pays for a real render. All
+# output is captured to the cache via an fd redirect + EXIT trap, so every exit
+# path (including the early "no data" exits below) finalizes the cache and still
+# writes the menu to SwiftBar on the saved stdout (fd 3).
+CACHE="$HOME/.cache/claude-usage/menu.txt"
+CACHE_MAX_AGE=25
+if [ -f "$CACHE" ]; then
+  age=$(( $(date +%s) - $(stat -f %m "$CACHE" 2>/dev/null || echo 0) ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$CACHE_MAX_AGE" ]; then
+    cat "$CACHE"
+    exit 0
+  fi
+fi
+mkdir -p "$(dirname "$CACHE")"
+CACHE_TMP="$CACHE.$$"
+exec 3>&1 >"$CACHE_TMP"
+trap 'mv -f "$CACHE_TMP" "$CACHE" 2>/dev/null; cat "$CACHE" >&3 2>/dev/null' EXIT
 
 ENDPOINT="http://localhost:7823/usage"
 
@@ -291,14 +317,20 @@ generate_label_b64() {
   # padding above and below the text; bump BODY for more top/bottom pill padding.
   local body=37 rx
   rx=$(( body * 7 / 30 ))                    # scale corner radius with height
-  # ~0.607 pt/unit keeps the established horizontal scale; the pill (and row) grow
-  # taller with BODY.
+  # PADT / PADB units of transparent space ABOVE / BELOW the pill body act as the
+  # gaps to the rows around it — baked into the pill's own (already tall) image row
+  # so they aren't subject to SwiftBar's minimum-row-height clamp the way a separate
+  # spacer row is. Each unit is ~0.607pt, so 8 ≈ 5px.
+  local padT=8 padB=8 vbh
+  vbh=$(( padT + body + padB ))
+  # ~0.607 pt/unit keeps the established horizontal scale; the image (and row) grow
+  # taller with PADT + BODY + PADB.
   local hpt wpt ty
-  hpt=$(awk -v v="$body" 'BEGIN { printf "%.2f", v * 18.2 / 30 }')
+  hpt=$(awk -v v="$vbh" 'BEGIN { printf "%.2f", v * 18.2 / 30 }')
   wpt=$(awk -v w="$w" 'BEGIN { printf "%.1f", w * 18.2 / 30 }')
-  ty=$(awk -v b="$body" 'BEGIN { printf "%.1f", (b + 18 * 0.717) / 2 }')  # center caps
-  local svg='<svg xmlns="http://www.w3.org/2000/svg" width="'"$wpt"'pt" height="'"$hpt"'pt" viewBox="0 0 '"$w"' '"$body"'">
-    <rect x="0" y="0" width="'"$w"'" height="'"$body"'" rx="'"$rx"'" fill="'"$bg"'"/>
+  ty=$(awk -v b="$body" -v pt="$padT" 'BEGIN { printf "%.1f", pt + (b + 18 * 0.717) / 2 }')  # center caps
+  local svg='<svg xmlns="http://www.w3.org/2000/svg" width="'"$wpt"'pt" height="'"$hpt"'pt" viewBox="0 0 '"$w"' '"$vbh"'">
+    <rect x="0" y="'"$padT"'" width="'"$w"'" height="'"$body"'" rx="'"$rx"'" fill="'"$bg"'"/>
     <text x="'"$((w/2))"'" y="'"$ty"'" font-family="Helvetica" font-size="18" font-weight="bold" fill="#ffffff" text-anchor="middle">'"$text"'</text>
   </svg>'
   if command -v rsvg-convert >/dev/null 2>&1; then
@@ -362,7 +394,7 @@ generate_reset_b64() {
     xrest=18
     glyph='<path transform="translate(0,12.2) scale(0.006442,-0.006442)" fill="#8a8a8a" d="M838 -36Q693 -36 566.5 18.5Q440 73 344.0 169.0Q248 265 194.0 391.5Q140 518 140 662Q140 807 194.0 933.5Q248 1060 344.0 1156.0Q440 1252 566.5 1306.0Q693 1360 838 1360Q898 1360 955.5 1350.5Q1013 1341 1066 1321Q1083 1315 1103.5 1300.5Q1124 1286 1124 1251Q1124 1223 1108.5 1205.5Q1093 1188 1069.5 1182.5Q1046 1177 1023 1186Q936 1217 838 1217Q723 1217 622.5 1174.0Q522 1131 446.0 1055.0Q370 979 327.0 878.5Q284 778 284 663Q284 549 327.0 448.5Q370 348 446.0 272.0Q522 196 622.5 153.0Q723 110 838 110Q953 110 1053.5 153.0Q1154 196 1230.0 272.0Q1306 348 1349.0 448.5Q1392 549 1392 663Q1392 693 1413.0 714.0Q1434 735 1464 735Q1494 735 1515.0 714.0Q1536 693 1536 663Q1536 518 1482.0 391.5Q1428 265 1332.0 169.0Q1236 73 1109.5 18.5Q983 -36 838 -36ZM1038 1263 766 1531Q756 1541 751.5 1554.5Q747 1568 747 1582Q747 1613 767.5 1634.5Q788 1656 817 1656Q847 1656 869 1634L1185 1314Q1206 1293 1206 1263Q1206 1232 1185 1211L869 895Q848 875 817 875Q788 875 767.5 895.5Q747 916 747 947Q747 961 752.0 974.0Q757 987 767 997Z"/>'
   fi
-  local rlen=${#rest} w H=26
+  local rlen=${#rest} w H=21
   # ~8pt per char + glyph zone + padding; generous so the text never clips.
   w=$(( xrest + rlen * 8 + 8 ))
   local esc
@@ -417,18 +449,13 @@ else
 fi
 echo "---"
 
-# Action shortcuts:
-#   $C — clickable row that opens the usage page (renders white in dark mode).
-#   $G — clickable row that triggers a refresh (rendered grey).
-#   No suffix means no action -> macOS renders the row dimmed/grey automatically.
-USAGE_URL="https://claude.ai/new#settings/usage"
-COST_URL="https://platform.claude.com/workspaces/default/cost"
-CODEX_URL="https://chatgpt.com/codex"
-REFRESH_HELPER="$HOME/.local/bin/claude-usage-refresh"
-C="href=$USAGE_URL"
-CC="href=$COST_URL"
-CX="href=$CODEX_URL"
-G="bash=$REFRESH_HELPER terminal=false refresh=true color=#888888,#888888"
+# Row suffixes. Every row is purely informational: no href/bash actions, so macOS
+# auto-disables the items and they are neither selectable (no hover highlight) nor
+# clickable. $G keeps just a grey color for the footer.
+C=""
+CC=""
+CX=""
+G="color=#888888,#888888"
 
 # Codex usage comes from local Codex CLI logs, independent of the Claude server,
 # so it renders in every path -- always visible, even at 100% or when the
@@ -443,7 +470,6 @@ render_codex() {
   printf '\xc2\xa0\n'
   # Green pill title (rendered as a full-color image; see the Claude header note).
   echo " | image=$(generate_label_b64 "Codex" "#16a34a")"
-  echo "---"
   # Capped: the limit is exhausted and Codex stops reporting a 5h window, so show
   # the cap state rather than a stale percentage.
   if [ "$CODEX_CAPPED" = "1" ]; then
@@ -496,7 +522,6 @@ SESSION_HEADER_RESET="$SESSION_RESET_AT"
 [ -z "$SESSION_HEADER_RESET" ] && SESSION_HEADER_RESET="$SESSION_RESET"
 # Blue pill title (rendered as a full-color image; SwiftBar can't color a row bg).
 echo " | image=$(generate_label_b64 "Claude" "#3b82f6")"
-echo "---"
 if [ -n "$SESSION_PCT" ]; then
   echo "${SESSION_PCT}% | image=$(generate_bar_b64 "$SESSION_PCT" "#3b82f6") size=12 $C"
 fi
@@ -536,7 +561,6 @@ fi
 if [ -n "$WEEKLY_FABLE_PCT" ]; then
   printf '\xc2\xa0\n'
   echo " | image=$(generate_label_b64 "Fable" "#9333ea")"
-  echo "---"
   echo "${WEEKLY_FABLE_PCT}% | image=$(generate_bar_b64 "$WEEKLY_FABLE_PCT" "#9333ea") size=12 $C"
 fi
 
