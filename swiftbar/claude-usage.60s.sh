@@ -183,13 +183,17 @@ fi
 
 # --- Codex usage (read from the local Codex CLI session logs) ---
 # The OpenAI Codex CLI appends `rate_limits` events to its session rollout files
-# under ~/.codex/sessions/. `primary` is the 5-hour window. While Codex is usable
-# it reports `limit_id: "codex"` with a populated primary. When a higher limit is
-# hit (the weekly cap), Codex flips to `limit_id: "premium"` with a NULL primary
-# and no credits left -- so we must NOT just walk back to the last populated
-# primary (that freezes the tile on a stale percentage whose reset time is now in
-# the past). Instead we read the genuinely most recent event to detect the capped
-# state, and only trust a primary reading whose window has not yet reset.
+# under ~/.codex/sessions/. Each event carries up to two windows -- a short
+# rolling "session" window (~300 min) and a long "weekly" window (10080 min).
+# IMPORTANT: do NOT key off the `primary`/`secondary` slot names. Older builds put
+# the 5h window in `primary` and the weekly in `secondary`; newer builds report
+# ONLY the weekly window, and put it in `primary`. Keying off the slot made the
+# weekly reading (e.g. "2%, resets in 162h") render in the 5h row. Instead we
+# classify each window by its `window_minutes` (< 1 day = session, else weekly)
+# and fill the session/weekly buckets independently. Any given build may report
+# one bucket or both; a missing bucket simply doesn't render. `capped` is detected
+# from the genuinely most recent event (an explicit rate_limit_reached_type, or a
+# premium limit with no credits left).
 CODEX_PCT=""
 CODEX_RESET_AT=""
 CODEX_RESET_EPOCH=""
@@ -201,16 +205,27 @@ if [ -d "$CODEX_SESSIONS" ]; then
   # Newest-first list of recent rollout files (capped for speed).
   CODEX_FILES=$(find "$CODEX_SESSIONS" -name 'rollout-*.jsonl' -type f 2>/dev/null \
     | xargs ls -t 2>/dev/null | head -20)
-  # Emits five lines: primary used_percent, primary resets_at, capped flag (0/1),
-  # weekly (secondary) used_percent, weekly resets_at. Any field may be blank.
-  # `capped` is 1 when the most recent rate_limits event has no primary AND
-  # signals exhaustion (limit_id=premium with no credits, or an explicit
-  # rate_limit_reached_type). The weekly fields come from the most recent event
-  # carrying a `secondary` window (the 7-day limit) -- the capped premium events
-  # drop it, so we look back for the last one that reported it.
+  # Emits five lines: session used_percent, session resets_at, capped flag (0/1),
+  # weekly used_percent, weekly resets_at. Any field may be blank. Windows are
+  # classified by `window_minutes` (< 1 day = session, else weekly), NOT by slot,
+  # so a build that reports the weekly window in `primary` still lands in the
+  # weekly bucket. For each bucket we keep the most recent populated reading found
+  # walking the files newest-first.
   CODEX_INFO=$(python3 - $CODEX_FILES <<'PY' 2>/dev/null
 import json, sys
-prim_pct = prim_reset = None
+
+# Classify a rate-limit window by its length. The rolling session window is short
+# (~300 min); the weekly window is long (10080 min). Fall back to the slot name
+# only for the pre-window_minutes schema.
+def kind_of(w, slot):
+    if not w:
+        return None
+    wm = w.get("window_minutes")
+    if isinstance(wm, (int, float)):
+        return "session" if wm < 1440 else "weekly"
+    return "session" if slot == "primary" else "weekly"
+
+session_pct = session_reset = None
 weekly_pct = weekly_reset = None
 latest = None                        # most recent rate_limits event overall
 for path in sys.argv[1:]:            # files already newest-first
@@ -233,32 +248,32 @@ for path in sys.argv[1:]:            # files already newest-first
         continue
     if latest is None:               # newest file's last event = global latest
         latest = events[-1]
-    if prim_pct is None:
-        for rl in reversed(events):  # most recent populated primary in this file
-            p = rl.get("primary") or {}
-            if p.get("used_percent") is not None:
-                prim_pct, prim_reset = p.get("used_percent"), p.get("resets_at")
-                break
-    if weekly_pct is None and weekly_reset is None:
-        for rl in reversed(events):  # most recent populated secondary (weekly)
-            s = rl.get("secondary") or {}
-            if s.get("used_percent") is not None or s.get("resets_at") is not None:
-                weekly_pct = s.get("used_percent")
-                weekly_reset = s.get("resets_at")
-                break
-    if prim_pct is not None and weekly_reset is not None:
+    for rl in reversed(events):      # newest-first within this file
+        for slot in ("primary", "secondary"):
+            w = rl.get(slot)
+            if not w:
+                continue
+            if w.get("used_percent") is None and w.get("resets_at") is None:
+                continue
+            k = kind_of(w, slot)
+            if k == "session" and session_pct is None and session_reset is None:
+                session_pct, session_reset = w.get("used_percent"), w.get("resets_at")
+            elif k == "weekly" and weekly_pct is None and weekly_reset is None:
+                weekly_pct, weekly_reset = w.get("used_percent"), w.get("resets_at")
+    if (session_pct is not None or session_reset is not None) and \
+       (weekly_pct is not None or weekly_reset is not None):
         break
 
 capped = 0
-if latest is not None and (latest.get("primary") or {}).get("used_percent") is None:
+if latest is not None:
     creds = latest.get("credits") or {}
     if latest.get("rate_limit_reached_type"):
         capped = 1
     elif latest.get("limit_id") == "premium" and creds.get("has_credits") is False:
         capped = 1
 
-print("" if prim_pct is None else prim_pct)
-print("" if prim_reset in (None, "null") else prim_reset)
+print("" if session_pct is None else session_pct)
+print("" if session_reset in (None, "null") else session_reset)
 print(capped)
 print("" if weekly_pct is None else weekly_pct)
 print("" if weekly_reset in (None, "null") else weekly_reset)
@@ -272,21 +287,25 @@ EOF
   [ -n "$CODEX_PCT_RAW" ] && CODEX_PCT=$(awk -v p="$CODEX_PCT_RAW" 'BEGIN { printf "%.0f", p }')
   [ -n "$CODEX_WEEKLY_PCT_RAW" ] && CODEX_WEEKLY_PCT=$(awk -v p="$CODEX_WEEKLY_PCT_RAW" 'BEGIN { printf "%.0f", p }')
 
-  # A primary (5h) reading is only valid while its window is still open. If the
-  # reset time has already passed, the window has rolled over and we have no
-  # current reading -> drop the stale percentage rather than freezing on it.
+  # A session (5h) reading is only valid while its window is still open.
   NOW_EPOCH=$(date +%s)
   if [ -n "$CODEX_RESET_EPOCH" ] && [ "$CODEX_RESET_EPOCH" != "null" ] \
      && [ "$CODEX_RESET_EPOCH" -gt "$NOW_EPOCH" ] 2>/dev/null; then
     CODEX_RESET_TIME=$(date -r "$CODEX_RESET_EPOCH" +"%-I:%M %p" 2>/dev/null)
     [ -n "$CODEX_RESET_TIME" ] && CODEX_RESET_AT="${CODEX_RESET_TIME}"
-  else
-    # The 5h window has rolled over (or there's no forward reset time) and we
-    # have no live reading. The window restarting means usage is back to 0% --
-    # so report a fresh 0% rather than hiding Codex entirely. Drop the stale
-    # reset time (it's in the past); we can't know the next reset until Codex
-    # runs again, so the reset row simply won't render.
+  elif [ -n "$CODEX_PCT_RAW" ]; then
+    # A session window WAS reported but its reset time has passed -> the window
+    # rolled over, so usage is back to 0%. Show a fresh 0% rather than freezing on
+    # the stale percentage; drop the past reset time (we can't know the next one
+    # until Codex runs again, so the reset row simply won't render).
     CODEX_PCT="0"
+    CODEX_RESET_AT=""
+    CODEX_RESET_EPOCH=""
+  else
+    # No session window at all -- newer Codex builds report only the weekly
+    # window. Hide the session rows entirely so we don't invent a phantom 0% row;
+    # the weekly rows below carry the real data.
+    CODEX_PCT=""
     CODEX_RESET_AT=""
     CODEX_RESET_EPOCH=""
   fi
