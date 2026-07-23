@@ -92,10 +92,15 @@
     // this tab is on a different account or in a transitional render —
     // skip rather than overwrite good data from another tab.
     if (session && !session.reset) return null;
+    // usageTs is a distinct top-level key (survives the server's shallow merge)
+    // so the menu can tell how fresh the claude.ai scrape is, independent of the
+    // provider-cost scrapes that also bump the shared updatedAt.
+    const now = Date.now();
     return {
       session: session || null,
       weekly: weekly || {},
-      updatedAt: Date.now(),
+      updatedAt: now,
+      usageTs: now,
     };
   }
 

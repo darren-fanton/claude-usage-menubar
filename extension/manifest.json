@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Claude Usage Reporter",
+  "name": "AI Usage",
   "version": "1.1.0",
-  "description": "Scrapes Claude.ai usage limits and POSTs them to a local menu bar server.",
+  "description": "Scrapes Claude.ai usage limits and provider API spend, and POSTs them to a local menu bar server.",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -14,12 +14,17 @@
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
     },
-    "default_title": "Claude Usage Reporter"
+    "default_title": "AI Usage — click to open all usage pages"
+  },
+  "background": {
+    "service_worker": "background.js"
   },
   "permissions": [],
   "host_permissions": [
     "https://claude.ai/*",
     "https://platform.claude.com/*",
+    "https://platform.openai.com/*",
+    "https://aistudio.google.com/*",
     "http://localhost:7823/*"
   ],
   "content_scripts": [
@@ -31,6 +36,21 @@
     {
       "matches": ["https://platform.claude.com/*"],
       "js": ["cost.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://platform.claude.com/settings/billing*"],
+      "js": ["apicost-claude.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://platform.openai.com/*"],
+      "js": ["apicost-openai.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://aistudio.google.com/*"],
+      "js": ["apicost-google.js"],
       "run_at": "document_idle"
     }
   ]

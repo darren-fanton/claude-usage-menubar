@@ -49,18 +49,19 @@ WEEKLY_DESIGN_PCT=$(parse '.weekly.design.pct')
 WEEKLY_DESIGN_RESET=$(parse '.weekly.design.reset')
 WEEKLY_OPUS_PCT=$(parse '.weekly.opus.pct')
 WEEKLY_OPUS_RESET=$(parse '.weekly.opus.reset')
-COST_TOTAL=$(parse '.cost.totalUSD')
-COST_OPUS=$(parse '.cost.perModel.opus')
-COST_SONNET=$(parse '.cost.perModel.sonnet')
-COST_HAIKU=$(parse '.cost.perModel.haiku')
 UPDATED_AT=$(parse '.updatedAt')
+USAGE_TS=$(parse '.usageTs')
 
-# Format a number as $XX.XX (or "-" if empty).
-fmt_usd() {
-  local n="$1"
-  [ -z "$n" ] && { echo "-"; return; }
-  awk -v n="$n" 'BEGIN { printf "$%.2f", n }'
-}
+# API Usage (percent of budget + dollars spent) per provider.
+API_CLAUDE_PCT=$(parse '.apiCostClaude.pct')
+API_CLAUDE_USD=$(parse '.apiCostClaude.usd')
+API_CLAUDE_TS=$(parse '.apiCostClaude.ts')
+API_OPENAI_PCT=$(parse '.apiCostOpenai.pct')
+API_OPENAI_USD=$(parse '.apiCostOpenai.usd')
+API_OPENAI_TS=$(parse '.apiCostOpenai.ts')
+API_GOOGLE_PCT=$(parse '.apiCostGoogle.pct')
+API_GOOGLE_USD=$(parse '.apiCostGoogle.usd')
+API_GOOGLE_TS=$(parse '.apiCostGoogle.ts')
 
 # --- Time-elapsed calculation for the pie chart ---
 # Claude sessions are 5-hour rolling windows, so 300 minutes total.
@@ -187,87 +188,137 @@ else
 fi
 echo "---"
 
-# Action shortcuts:
-#   $C — clickable row that opens the usage page (renders white in dark mode).
-#   $G — clickable row that triggers a refresh (rendered grey).
-#   No suffix means no action -> macOS renders the row dimmed/grey automatically.
+# Action shortcuts. SwiftBar rows: `href=` opens a URL; `bash=... param1=...`
+# runs an executable (default text color = white in dark mode); no suffix ->
+# macOS dims the row grey automatically.
 USAGE_URL="https://claude.ai/settings/usage"
-COST_URL="https://platform.claude.com/workspaces/default/cost"
+CLAUDE_BILLING_URL="https://platform.claude.com/settings/billing"
+OPENAI_URL="https://platform.openai.com/settings/proj_vxOhdwuqhmqTXXVDefWUzMRY/limits"
+GOOGLE_URL="https://aistudio.google.com/u/2/spend?project=gen-lang-client-0546438527"
 REFRESH_HELPER="$HOME/.local/bin/claude-usage-refresh"
-C="href=$USAGE_URL"
-CC="href=$COST_URL"
+
+# Header rows that trigger a scoped refresh (reload just that tab group).
+REFRESH_USAGE="bash=$REFRESH_HELPER param1=usage terminal=false refresh=true"
+REFRESH_APICOST="bash=$REFRESH_HELPER param1=apicost terminal=false refresh=true"
+# Grey footer row that refreshes everything.
 G="bash=$REFRESH_HELPER terminal=false refresh=true color=#888888,#888888"
 
 if [ -z "$JSON" ]; then
   echo "No data — is the local server running? | color=red"
-  echo "Open Claude.ai | $C"
+  echo "Open Claude.ai | href=$USAGE_URL"
   exit 0
 fi
 
-# --- Session block ---
-# Grey header line (no action). Prefer the absolute reset time we computed
-# above; fall back to whatever the page said ("Resets in 1 hr 50 min").
-SESSION_HEADER_RESET="$SESSION_RESET_AT"
-[ -z "$SESSION_HEADER_RESET" ] && SESSION_HEADER_RESET="$SESSION_RESET"
-if [ -n "$SESSION_HEADER_RESET" ]; then
-  echo "Session – ${SESSION_HEADER_RESET}"
-else
-  echo "Session"
-fi
-# White data row.
-if [ -n "$SESSION_PCT" ]; then
-  echo "All Models: ${SESSION_PCT}% Used | $C"
-fi
-
-echo "---"
-
-# --- Weekly block ---
-WEEKLY_RESET="$WEEKLY_ALL_RESET"
-[ -z "$WEEKLY_RESET" ] && WEEKLY_RESET="$WEEKLY_SONNET_RESET"
-[ -z "$WEEKLY_RESET" ] && WEEKLY_RESET="$WEEKLY_OPUS_RESET"
-[ -z "$WEEKLY_RESET" ] && WEEKLY_RESET="$WEEKLY_DESIGN_RESET"
-
-if [ -n "$WEEKLY_RESET" ]; then
-  echo "Weekly – ${WEEKLY_RESET}"
-else
-  echo "Weekly"
-fi
-
-row() {
-  local label="$1" pct="$2"
-  if [ -n "$pct" ]; then
-    echo "${label}: ${pct}% Used | $C"
-  fi
+# --- Short reset-time formatting ---------------------------------------------
+# Render an epoch (seconds) as "9:20p" / "1:05a" — full time, no rounding.
+short_time_from_epoch() {
+  local epoch="$1"
+  [ -z "$epoch" ] && return
+  local hm p letter
+  hm=$(date -r "$epoch" +"%-I:%M" 2>/dev/null)
+  p=$(date -r "$epoch" +"%p" 2>/dev/null)
+  [ -z "$hm" ] && return
+  letter="a"; [ "$p" = "PM" ] && letter="p"
+  echo "${hm}${letter}"
 }
 
-row "All Models" "$WEEKLY_ALL_PCT"
-row "Sonnet"     "$WEEKLY_SONNET_PCT"
-row "Opus"       "$WEEKLY_OPUS_PCT"
-row "Design"     "$WEEKLY_DESIGN_PCT"
+# Turn "Resets Tue 12:59 AM" into just the day ("Tues").
+weekly_short() {
+  local s="$1"
+  local day
+  day=$(echo "$s" | grep -oE '(Mon|Tue|Wed|Thu|Fri|Sat|Sun)' | head -1)
+  [ -z "$day" ] && return
+  case "$day" in
+    Tue) day="Tues" ;;
+    Thu) day="Thurs" ;;
+  esac
+  echo "${day}"
+}
 
-# --- API Cost block ---
-# Show only if we have any cost data (otherwise the section is hidden).
-if [ -n "$COST_TOTAL$COST_OPUS$COST_SONNET$COST_HAIKU" ]; then
-  echo "---"
-  echo "API Cost – Month to Date"
-  [ -n "$COST_TOTAL"  ] && echo "All Models: $(fmt_usd "$COST_TOTAL") | $CC"
-  [ -n "$COST_OPUS"   ] && echo "Opus: $(fmt_usd "$COST_OPUS") | $CC"
-  [ -n "$COST_SONNET" ] && echo "Sonnet: $(fmt_usd "$COST_SONNET") | $CC"
-  [ -n "$COST_HAIKU"  ] && echo "Haiku: $(fmt_usd "$COST_HAIKU") | $CC"
+# Format a number as "$X.XX" (empty stays empty).
+fmt_usd() {
+  local n="$1"
+  [ -z "$n" ] && return
+  awk -v n="$n" 'BEGIN { printf "$%.2f", n }'
+}
+
+# --- API Usage row: "Claude: 25% / $12.34" in the provider's brand color ------
+# Falls back to just the percent or just the dollars if one is missing, or to
+# "— (no data)" if both are. Freshness is conveyed by the "Last update" footer,
+# not per-row, so rows never change color or say "stale".
+api_cost_row() {
+  local label="$1" pct="$2" usd="$3" color="$4"
+  local money val
+  money=$(fmt_usd "$usd")
+  if [ -z "$pct" ] && [ -z "$money" ]; then
+    echo "${label}: — (no data)"
+    return
+  fi
+  if [ -n "$pct" ] && [ -n "$money" ]; then val="${pct}% · ${money}"
+  elif [ -n "$pct" ]; then val="${pct}%"
+  else val="${money}"; fi
+  echo "${label}: ${val} | color=${color},${color}"
+}
+
+# --- Claude Usage block ------------------------------------------------------
+echo "Claude Usage | $REFRESH_USAGE"
+
+# Claude's brand orange (used for the Claude API Usage row).
+CLAUDE_ORANGE="#D97757"
+# Session and Weekly share their own accent (red).
+USAGE_ACCENT="#F97171"
+SESSION_SHORT=$(short_time_from_epoch "$RESET_EPOCH")
+if [ -n "$SESSION_PCT" ]; then
+  if [ -n "$SESSION_SHORT" ]; then
+    echo "Session: ${SESSION_PCT}% · ${SESSION_SHORT} | color=${USAGE_ACCENT},${USAGE_ACCENT}"
+  else
+    echo "Session: ${SESSION_PCT}% | color=${USAGE_ACCENT},${USAGE_ACCENT}"
+  fi
+fi
+
+WEEKLY_SHORT=$(weekly_short "$WEEKLY_ALL_RESET")
+if [ -n "$WEEKLY_ALL_PCT" ]; then
+  if [ -n "$WEEKLY_SHORT" ]; then
+    echo "Weekly: ${WEEKLY_ALL_PCT}% · ${WEEKLY_SHORT} | color=${USAGE_ACCENT},${USAGE_ACCENT}"
+  else
+    echo "Weekly: ${WEEKLY_ALL_PCT}% | color=${USAGE_ACCENT},${USAGE_ACCENT}"
+  fi
 fi
 
 echo "---"
 
-if [ -n "$UPDATED_AT" ]; then
+# --- API Usage block (percent of budget + spend) -----------------------------
+# Always list all three providers so a missing one is obviously flagged.
+# The header refreshes; the provider rows are non-clickable, brand-colored labels.
+echo "API Usage | $REFRESH_APICOST"
+api_cost_row "Claude" "$API_CLAUDE_PCT" "$API_CLAUDE_USD" "$CLAUDE_ORANGE"
+api_cost_row "OpenAI" "$API_OPENAI_PCT" "$API_OPENAI_USD" "#0080F7"
+api_cost_row "Google" "$API_GOOGLE_PCT" "$API_GOOGLE_USD" "#11B55E"
+
+echo "---"
+
+# "Last update" reflects when everything was last current — i.e. the OLDEST of
+# the per-source timestamps (usage scrape + the three provider scrapes). That
+# way the footer alone tells you how stale the whole panel is.
+LAST_ALL=""
+for t in "$USAGE_TS" "$API_CLAUDE_TS" "$API_OPENAI_TS" "$API_GOOGLE_TS"; do
+  [ -z "$t" ] && continue
+  if [ -z "$LAST_ALL" ] || { [ "$t" -lt "$LAST_ALL" ] 2>/dev/null; }; then
+    LAST_ALL="$t"
+  fi
+done
+[ -z "$LAST_ALL" ] && LAST_ALL="$UPDATED_AT"
+
+if [ -n "$LAST_ALL" ]; then
   NOW_MS=$(($(date +%s) * 1000))
-  DELTA_MIN=$(( (NOW_MS - UPDATED_AT) / 60000 ))
+  DELTA_MIN=$(( (NOW_MS - LAST_ALL) / 60000 ))
   if [ "$DELTA_MIN" -le 0 ]; then
-    echo "Last updated: just now | $G"
+    echo "Last update: just now | $G"
   elif [ "$DELTA_MIN" -eq 1 ]; then
-    echo "Last updated: 1 min ago | $G"
+    echo "Last update: 1 min ago | $G"
   else
-    echo "Last updated: ${DELTA_MIN} min ago | $G"
+    echo "Last update: ${DELTA_MIN} min ago | $G"
   fi
 else
-  echo "Last updated: unknown | $G"
+  echo "Last update: unknown | $G"
 fi

@@ -1,6 +1,23 @@
-# Install — for Claude Code
+# Install / Update — for Claude Code
 
-> **Hi Claude.** Your user wants you to install this project on their macOS machine. Read through everything before you start so you understand the moving parts, then walk the user through it step by step. Do not run installation commands silently — narrate each step so the user knows what's happening on their machine. Stop and ask the user before any irreversible step (loading a LaunchAgent, editing files outside this folder, installing system packages, etc.).
+> **Hi Claude.** Your user just handed you this folder (unzipped from `claude-usage-menubar.zip`) and wants you to **install or update** this project on their macOS machine. Read through everything before you start so you understand the moving parts, then walk the user through it step by step. Do not run installation commands silently — narrate each step so the user knows what's happening on their machine. Stop and ask the user before any irreversible step (loading a LaunchAgent, editing files outside this folder, installing system packages, etc.).
+>
+> **First, figure out whether this is a fresh install or an update** — jump to [§0](#step-0--install-or-update) below before doing anything else. The two paths share the same building blocks but the update path is much shorter, and it ends with a manual step only the user can do (reloading the browser extension).
+
+## Step 0 — install or update?
+
+Run this to detect an existing install:
+
+```bash
+ls ~/Library/LaunchAgents/io.claude-usage.*.plist 2>/dev/null
+launchctl list | grep claude-usage 2>/dev/null
+ls -l "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.30s.sh" 2>/dev/null
+```
+
+- **Nothing found → fresh install.** Do Steps 1–4 in order.
+- **Plists / plugin already exist → this is an update.** Skip to [Updating an existing install](#updating-an-existing-install). Don't blindly re-run the fresh-install steps — you'll double-load LaunchAgents and may clobber the user's account-specific URLs.
+
+Either way, finish by reading [Manual steps — what to tell the user to do themselves](#manual-steps--what-to-tell-the-user-to-do-themselves) out loud to the user.
 
 ## What this is
 
@@ -74,7 +91,11 @@ Server logs land at `~/Library/Logs/claude-usage-server.log`.
 
 ## Step 2 — Install the auto-refresh helper + LaunchAgent
 
-This is the AppleScript-driven helper that reloads the user's open `claude.ai/settings/usage` and `platform.claude.com/workspaces/default/cost` tabs every 60s, so the scrape stays fresh. It only touches those two exact URLs — other claude.ai tabs (chats, projects) are left alone.
+This is the AppleScript-driven helper that reloads the user's open scrape tabs every 60s, so the data stays fresh. It only touches the exact URLs it scrapes — other tabs (chats, projects, unrelated pages) are left alone. It takes an optional group argument so the menu can refresh a subset:
+
+- `claude-usage-refresh usage` → just `claude.ai/settings/usage`
+- `claude-usage-refresh apicost` → the three billing pages (Claude / OpenAI / Google)
+- `claude-usage-refresh` (no arg, used by the LaunchAgent) → all of them
 
 ```bash
 mkdir -p "$HOME/.local/bin"
@@ -102,7 +123,12 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 2. Toggle **Developer mode** in the top right.
 3. Click **Load unpacked** and select the `extension/` folder inside this project.
 4. Open <https://claude.ai/settings/usage> and leave the tab open. The content script scrapes whatever's in the DOM and POSTs to `localhost:7823`.
-5. (Optional) For API cost data, also open <https://platform.claude.com/workspaces/default/cost>.
+5. (Optional) For the **API Usage** section, also open — and leave open — one tab per provider you want tracked. Each is a login-only page scraped by its own content script:
+   - Claude: <https://platform.claude.com/settings/billing>
+   - OpenAI: `https://platform.openai.com/settings/proj_.../limits` (your project's limits page)
+   - Google: `https://aistudio.google.com/u/2/spend?project=...` (your AI Studio spend page)
+
+   The OpenAI/Google URLs are account-specific and are hardcoded in `swiftbar/refresh-usage.sh` and the menu script — update them if your project IDs differ. The scrapers rely on the pages' current CSS classes; if a provider redesigns, adjust the selectors in `extension/apicost-*.js`.
 
 Verify after they've loaded the extension and opened the page:
 
@@ -142,25 +168,72 @@ The filename's `.30s.` suffix tells SwiftBar to re-run it every 30 seconds.
 **Dropdown:**
 
 ```
-Session – Resets at 4:51 PM
-All Models: 19% Used
+Claude Usage              ← click to refresh session/weekly
+Session: 4% / 5p
+Weekly: 18% / Tues 1a
 ---
-Weekly – Resets Tue 1:00 AM
-All Models: 49% Used
-Sonnet: 39% Used
-Opus: 12% Used
-Design: 0% Used
+API Usage                 ← click to refresh the three provider numbers
+Claude: 25% / $12.34
+OpenAI: 10% / $0.07
+Google: 3% / $4.48
 ---
-API Cost – Month to Date
-All Models: $2.63
-Opus: $2.49
-Sonnet: $0.10
-Haiku: $0.04
----
-Last updated: just now
+Last update: just now     ← click to refresh everything
 ```
 
-(The cost block only appears if the user opened `platform.claude.com/workspaces/default/cost` and the cost-scraper script ran.)
+- **Claude Usage** and **API Usage** are clickable headers that refresh their own numbers. Every row beneath them is a non-clickable, brand-colored label: session/weekly and Claude in orange (`#D97757`), OpenAI blue (`#0080F7`), Google green (`#11B55E`).
+- **API Usage** rows show percent-of-budget and month-to-date spend for each provider (`— (no data)` until that provider's page has been scraped). For OpenAI and Google the percent is computed as `spend ÷ cap`, where the cap is set via `MONTHLY_CAP_USD` at the top of `extension/apicost-openai.js` / `apicost-google.js`.
+- **Last update** shows the age of the *oldest* source (usage scrape + the three provider scrapes), so the footer alone tells you how fresh the whole panel is — rows themselves never show staleness.
+
+## Updating an existing install
+
+Use this path when Step 0 found existing LaunchAgents/plugin. The goal: refresh the code in place without disturbing the user's account-specific settings.
+
+**Before you overwrite anything, preserve the user's customizations.** These files commonly carry per-user edits — diff the incoming version against what's already installed and carry the user's values forward (or ask before overwriting):
+
+- `extension/apicost-openai.js` / `extension/apicost-google.js` — `MONTHLY_CAP_USD` and the hardcoded project-specific limits/spend URLs.
+- `swiftbar/refresh-usage.sh` and `swiftbar/claude-usage.30s.sh` — the hardcoded OpenAI/Google URLs.
+- `extension/content.js` — any hand-tuned `RESET_SELECTOR` the user patched after a Claude redesign.
+
+```bash
+# Run from the freshly-unzipped project root
+PROJECT_DIR="$PWD"
+
+# Where the currently-installed project lives (the SwiftBar plugin is usually a
+# symlink pointing straight at it — follow it to find the real folder):
+INSTALLED_PLUGIN="$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.30s.sh"
+readlink "$INSTALLED_PLUGIN"    # -> .../claude-usage-menubar/swiftbar/claude-usage.30s.sh
+```
+
+**If the new folder IS the same folder the install already points at** (the user unzipped over the top, or you're updating a git checkout in place), the SwiftBar plugin symlink and the `refresh-usage.sh` copy will already see the new code — you only need to bounce the services:
+
+```bash
+# Re-copy the refresh helper (it's a real copy in ~/.local/bin, not a symlink)
+cp "$PROJECT_DIR/swiftbar/refresh-usage.sh" "$HOME/.local/bin/claude-usage-refresh"
+chmod +x "$HOME/.local/bin/claude-usage-refresh"
+
+# Restart the server + refresh LaunchAgents so they pick up new server.js / helper code
+for a in server refresh; do
+  launchctl unload ~/Library/LaunchAgents/io.claude-usage.$a.plist 2>/dev/null
+  launchctl load   ~/Library/LaunchAgents/io.claude-usage.$a.plist
+done
+
+# Re-point the SwiftBar symlink (harmless if already correct) and nudge SwiftBar to re-run
+ln -sf "$PROJECT_DIR/swiftbar/claude-usage.30s.sh" "$INSTALLED_PLUGIN"
+```
+
+**If the plist internals changed** (rare — only if `server/*.plist` differs from what's installed), re-materialize them exactly as in Steps 1–2 (the `sed` blocks), then unload/load.
+
+Finish by verifying (the checklist at the bottom) and then walk the user through the [manual steps](#manual-steps--what-to-tell-the-user-to-do-themselves) — **the extension will NOT update itself; the user has to reload it by hand.**
+
+## Manual steps — what to tell the user to do themselves
+
+You cannot do these on the user's behalf. After install/update, tell them explicitly:
+
+1. **Reload the Chrome extension (required on every update).** Open `chrome://extensions` (or the Dia/Arc/Brave equivalent), find **AI Usage**, and click the **↻ reload** icon on its card. On a *fresh* install they instead click **Load unpacked** and pick the `extension/` folder (Step 3). Chrome does not auto-pick-up changed extension files — an un-reloaded extension keeps running the old code.
+2. **Keep the scrape tabs open.** At minimum a tab at <https://claude.ai/settings/usage>. For the API Usage rows, one tab each for the Claude / OpenAI / Google billing pages (Step 3, item 5). The scrapers only see pages that are actually open.
+3. **Approve the Automation prompt** the first time the refresh helper runs — macOS asks to let the controlling app drive Chrome/Dia/Arc/Brave. It can appear silently under **System Settings → Privacy & Security → Automation**. If the menu bar never refreshes, this is the usual cause.
+4. **SwiftBar → Refresh All** (click the menu bar icon) if the plugin doesn't repaint on its own after an update.
+5. **Grant SwiftBar its one-time permissions** on a fresh install (it prompts on first launch).
 
 ## Project layout
 
@@ -171,7 +244,10 @@ claude-usage-menubar/
 ├── extension/
 │   ├── manifest.json
 │   ├── content.js                        # scrapes claude.ai usage page
-│   ├── cost.js                           # scrapes platform.claude.com cost page
+│   ├── cost.js                           # scrapes platform.claude.com cost page (legacy per-model)
+│   ├── apicost-claude.js                 # scrapes platform.claude.com/settings/billing
+│   ├── apicost-openai.js                 # scrapes platform.openai.com limits page
+│   ├── apicost-google.js                 # scrapes aistudio.google.com spend page
 │   └── icons/
 ├── server/
 │   ├── server.js                         # the Node server itself
