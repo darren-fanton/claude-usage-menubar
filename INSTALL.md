@@ -76,6 +76,8 @@ Server logs land at `~/Library/Logs/claude-usage-server.log`.
 
 This is the AppleScript-driven helper that reloads the user's open `claude.ai/settings/usage` and `platform.claude.com/workspaces/default/cost` tabs every 60s, so the scrape stays fresh. It only touches those two exact URLs — other claude.ai tabs (chats, projects) are left alone.
 
+Note that each run walks every tab of every window across four browsers, one Apple Event per tab. With many tabs open that is slow: measured 7.8s for 60 tabs in Dia and 3.0s in Chrome, ~11s total per run. It blocks the browsers' main threads, not the whole system, so it does not stall the menu bar — but it is the first thing to look at if the browser itself feels sticky.
+
 ```bash
 mkdir -p "$HOME/.local/bin"
 cp "$PROJECT_DIR/swiftbar/refresh-usage.sh" "$HOME/.local/bin/claude-usage-refresh"

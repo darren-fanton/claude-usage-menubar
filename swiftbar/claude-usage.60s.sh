@@ -51,13 +51,40 @@ trap 'mv -f "$CACHE_TMP" "$CACHE" 2>/dev/null; cat "$CACHE" >&3 2>/dev/null' EXI
 # disk keyed by the inputs that determine it, so a steady state spawns ~0
 # rsvg-convert processes instead of 19. The dir is versioned so a change to the
 # image-drawing code (bump IMG_V) invalidates every stale cached image at once.
-IMG_V=1
+IMG_V=2
 IMGCACHE="$HOME/.cache/claude-usage/img/v$IMG_V"
 mkdir -p "$IMGCACHE"
 # Reset-countdown strings change each minute, so their images accumulate; evict
 # anything older than a day. One find per real render is negligible next to the
 # ~19 rsvg-convert calls the cache removes.
 find "$IMGCACHE" -type f -mtime +1 -delete 2>/dev/null
+
+# --- SVG -> base64 PNG ---
+# Renders $1 (SVG source) to a 2x PNG and stamps it 144 DPI, so NSImage reports the
+# SVG's own point size ($2 x $3) while carrying retina pixels.
+#
+# We deliberately do NOT emit PDF here. A PDF-backed NSImage has no pixel
+# representation, so CoreGraphics re-rasterizes it through WindowServer on every
+# draw. With 11 images in the dropdown that made each 60s SwiftBar refresh saturate
+# the compositor for ~4s, stalling input system-wide. A PNG is a straight blit.
+#   $1 = SVG source, $2 = width in pt, $3 = height in pt
+svg_to_b64() {
+  local svg="$1" w2 h2
+  w2=$(awk -v v="$2" 'BEGIN { printf "%.0f", v * 2 }')
+  h2=$(awk -v v="$3" 'BEGIN { printf "%.0f", v * 2 }')
+  if command -v rsvg-convert >/dev/null 2>&1 && command -v magick >/dev/null 2>&1; then
+    printf '%s' "$svg" \
+      | rsvg-convert --format=png -w "$w2" -h "$h2" 2>/dev/null \
+      | magick png:- -density 144 -units PixelsPerInch png:- 2>/dev/null \
+      | base64 | tr -d '\n'
+  else
+    # No librsvg: rasterize with ImageMagick alone, same 2x-at-144-DPI contract.
+    printf '%s' "$svg" \
+      | magick -background none -density 800 svg:- -filter Lanczos \
+               -resize "${w2}x${h2}" -density 144 -units PixelsPerInch png:- 2>/dev/null \
+      | base64 | tr -d '\n'
+  fi
+}
 
 ENDPOINT="http://localhost:7823/usage"
 
@@ -319,9 +346,8 @@ generate_pie_b64() {
   # empty ring at session start, fills clockwise as time passes, ends as a
   # full circle. Outline always visible; inner pie sits inside it with a gap.
   #
-  # Output is a vector PDF (via rsvg-convert) with a 16.5x16.5 pt MediaBox.
-  # NSImage rasterizes PDF natively at full retina resolution -- the same
-  # technique macOS apps like Focus use for crisp menu bar icons.
+  # Output is a 2x PNG stamped 144 DPI (see svg_to_b64), so NSImage reports a
+  # 16.5x16.5 pt image backed by 33x33 retina pixels.
   local pct=$1 svg _f="$IMGCACHE/pie-$1"
   [ -f "$_f" ] && { cat "$_f"; return; }
   if [ "$pct" -le 0 ]; then
@@ -343,14 +369,7 @@ generate_pie_b64() {
       <path d="M 50,20 A 30,30 0 '$large',1 '$bx','$by' L 50,50 Z" fill="black"/>
     </svg>'
   fi
-  { if command -v rsvg-convert >/dev/null 2>&1; then
-    echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
-  else
-    # Fallback: rasterize at 14x14 if librsvg isn't installed.
-    echo "$svg" \
-      | magick -background none -density 800 svg:- -filter Lanczos -resize 14x14 png:- 2>/dev/null \
-      | base64 | tr -d '\n'
-  fi ; } | tee "$_f"
+  svg_to_b64 "$svg" 16.5 16.5 | tee "$_f"
 }
 
 # Dash icon shown when the session has reset since the last data scrape,
@@ -362,13 +381,7 @@ generate_dash_b64() {
   local svg='<svg xmlns="http://www.w3.org/2000/svg" width="16.5pt" height="16.5pt" viewBox="0 0 100 100">
     <rect x="20" y="45" width="60" height="10" rx="3" fill="black"/>
   </svg>'
-  { if command -v rsvg-convert >/dev/null 2>&1; then
-    echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
-  else
-    echo "$svg" \
-      | magick -background none -density 800 svg:- -filter Lanczos -resize 14x14 png:- 2>/dev/null \
-      | base64 | tr -d '\n'
-  fi ; } | tee "$_f"
+  svg_to_b64 "$svg" 16.5 16.5 | tee "$_f"
 }
 
 # Render a colored "pill" title image (rounded rectangle + white label) for a
@@ -402,13 +415,7 @@ generate_label_b64() {
     <rect x="0" y="'"$padT"'" width="'"$w"'" height="'"$body"'" rx="'"$rx"'" fill="'"$bg"'"/>
     <text x="'"$((w/2))"'" y="'"$ty"'" font-family="Helvetica" font-size="18" font-weight="bold" fill="#ffffff" text-anchor="middle">'"$text"'</text>
   </svg>'
-  { if command -v rsvg-convert >/dev/null 2>&1; then
-    echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
-  else
-    echo "$svg" \
-      | magick -background none -density 800 svg:- -filter Lanczos -resize x36 png:- 2>/dev/null \
-      | base64 | tr -d '\n'
-  fi ; } | tee "$_f"
+  svg_to_b64 "$svg" "$wpt" "$hpt" | tee "$_f"
 }
 
 # Render a horizontal progress bar image: a rounded track (same hue at low opacity
@@ -434,13 +441,7 @@ generate_bar_b64() {
     <rect x="0" y="0" width="'"$W"'" height="'"$H"'" rx="6" fill="'"$fill"'" fill-opacity="0.22"/>
     <rect x="0" y="0" width="'"$fw"'" height="'"$H"'" rx="6" fill="'"$fill"'"/>
   </svg>'
-  { if command -v rsvg-convert >/dev/null 2>&1; then
-    echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
-  else
-    echo "$svg" \
-      | magick -background none -density 800 svg:- -filter Lanczos -resize x24 png:- 2>/dev/null \
-      | base64 | tr -d '\n'
-  fi ; } | tee "$_f"
+  svg_to_b64 "$svg" "$wpt" "$hpt" | tee "$_f"
 }
 
 # Render a reset time/date row ("↻ 1h 45m ( 4:49 PM )") as a grey image so we can
@@ -478,13 +479,7 @@ generate_reset_b64() {
     '"$glyph"'
     <text x="'"$xrest"'" y="11.5" font-family="Helvetica" font-size="13" fill="#8a8a8a">'"$esc"'</text>
   </svg>'
-  { if command -v rsvg-convert >/dev/null 2>&1; then
-    echo "$svg" | rsvg-convert --format=pdf 2>/dev/null | base64 | tr -d '\n'
-  else
-    echo "$svg" \
-      | magick -background none -density 800 svg:- -filter Lanczos -resize x52 png:- 2>/dev/null \
-      | base64 | tr -d '\n'
-  fi ; } | tee "$_f"
+  svg_to_b64 "$svg" "$w" "$H" | tee "$_f"
 }
 
 # Has the session reset time passed since we last scraped? If so, the cached
