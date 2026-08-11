@@ -261,6 +261,7 @@ claude-usage-menubar/
 ├── README.md
 ├── extension/                          # 60s usage pushes + API Cost rows
 │   ├── manifest.json
+│   ├── background.js                   # retrofits scripts into already-open tabs
 │   ├── usage.js                        # pushes plan usage from any claude.ai tab
 │   ├── cost.js                         # scrapes platform.claude.com spend
 │   ├── openai.js                       # scrapes platform.openai.com project spend
@@ -282,6 +283,7 @@ claude-usage-menubar/
 - **"Could not reach the usage API"** — the token was found but the call failed. Most often the token expired and Claude Code hasn't refreshed it yet; run any Claude Code command and it renews. Reproduce with the `curl` in §2.
 - **Usage percentages are right but API Cost rows are missing** — that's the extension half. Check the server (`curl http://localhost:7823/usage`) and that a `platform.claude.com/workspaces/*/cost` tab is open. Note the payload must use per-service keys (`cost.claude`); the older `cost.totalUSD` shape is ignored.
 - **Footer stuck on `(cached)`** — the usage API keeps failing. Usually HTTP 429 from too many calls; raise `USAGE_TTL` in the plugin. Check the live status with the `curl` in §2.
-- **Reloading the extension didn't take effect** — Chromium leaves already-injected content scripts running in open tabs after an extension reload. Reload or close the affected tabs too.
+- **A provider row never appears** — its content script probably isn't running in that tab. `background.js` retrofits scripts into already-open tabs on reload, so a plain extension reload should be enough; if a row is still missing, reload that tab and check `chrome://extensions` for errors on the service worker.
+- **Removing a content script doesn't stop it** — Chromium leaves already-injected scripts running in open tabs, orphaned, until those tabs reload. `background.js` can add scripts to open tabs but cannot remove them.
 - **Extension can't reach localhost** — verify `host_permissions` includes `http://localhost:7823/*` in `manifest.json` and that you reloaded the extension after editing.
 - **Server won't start as LaunchAgent** — check `~/Library/Logs/claude-usage-server.log`. Most often the `node` path in the plist is wrong; rerun the `sed` step from §1.

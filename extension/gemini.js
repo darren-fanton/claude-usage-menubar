@@ -19,6 +19,15 @@
 // `$rpc/...MakerSuiteService` backend, which is not practical to call directly.
 
 (() => {
+  // Guard against running twice in one tab. background.js retrofits open tabs when
+  // the extension reloads, and a tab that loaded normally already has us. All of an
+  // extension's content scripts share a single isolated world per tab, so a global
+  // flag is enough -- without it the second run starts a second timer and we POST
+  // twice a minute.
+  const _reg = (globalThis.__claudeUsageMenubar ||= {});
+  if (_reg.gemini) return;
+  _reg.gemini = true;
+
   const ENDPOINT = "http://localhost:7823/usage";
   const POLL_MS = 60_000;
 

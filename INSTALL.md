@@ -144,7 +144,7 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 
 Costs are tracked **per service, one row each** — never broken down by model. Any writer can add a provider by POSTing its own key (`cost.gemini`, …); the menu renders a row per numeric key it finds and needs no change.
 
-Note for reloads: Chromium keeps already-injected content scripts running in open tabs after an extension reload. After reloading the extension, also reload or close any affected tabs, or the old script keeps posting.
+Note for reloads: Chromium only injects content scripts when a page loads, so a newly added script does not reach tabs that are already open. `background.js` handles that — on install, update (which is what an unpacked reload fires) and browser startup it injects each content script into every open tab its patterns match, so reloading the extension is sufficient. The reverse still needs manual work: a script *removed* from the extension keeps running in open tabs until those tabs reload.
 
 There is no longer a claude.ai tab to open — usage comes from the API.
 
@@ -204,6 +204,7 @@ claude-usage-menubar/
 ├── README.md                             # original / longform reference
 ├── extension/
 │   ├── manifest.json
+│   ├── background.js                     # retrofits scripts into already-open tabs
 │   ├── usage.js                          # pushes plan usage from any claude.ai tab
 │   ├── openai.js                         # scrapes OpenAI project spend
 │   ├── gemini.js                         # scrapes AI Studio monthly spend
