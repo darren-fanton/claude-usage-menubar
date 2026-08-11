@@ -1,16 +1,26 @@
-// Scrapes API workspace cost from platform.claude.com/workspaces/*/cost.
-// Reads:
-//   - Total month-to-date cost from the "Total token cost" card.
-//   - Per-model breakdown by walking the Chart.js donut: programmatically
-//     hover slices around the ring and read the tooltip after each.
+// Scrapes API workspace cost from platform.claude.com/workspaces/*/cost ONLY.
+// Both the manifest match and the onCostPage() guard below enforce that: an
+// earlier build matched all of platform.claude.com, so it also ran on /docs/*
+// pages and posted numbers parsed out of their Next.js hydration payload.
+// Reads the total month-to-date cost from the "Total token cost" card and POSTs it
+// as `cost.claude` into the local server payload.
 //
-// POSTs a `cost` block into the existing local server payload.
+// There is deliberately no per-model breakdown. It used to walk the Chart.js donut
+// and hover each slice to read tooltips, which was ~100 lines of fragile DOM poking
+// for a split nobody wanted. Costs are tracked per SERVICE now, one row per
+// provider.
 
 (() => {
   const ENDPOINT = "http://localhost:7823/usage";
   const POLL_MS = 60_000;
 
-  const MODEL_KEYS = ["opus", "sonnet", "haiku"];
+  // The manifest match only gates the INITIAL injection, and the console is an
+  // SPA that can route away from the cost page without a reload. Re-check the
+  // path before every scrape so we never read numbers off some other console
+  // page and POST them as spend.
+  function onCostPage() {
+    return /^\/workspaces\/[^/]+\/cost\/?$/.test(location.pathname);
+  }
 
   // -- Total cost ----------------------------------------------------------
 
@@ -42,103 +52,17 @@
     return null;
   }
 
-  // -- Per-model breakdown -------------------------------------------------
-
-  // First try a static text scan: maybe there's a legend/table with model
-  // names + dollar amounts already in the DOM.
-  function readPerModelStatic() {
-    const found = {};
-    // Find every text node that mentions one of our models.
-    const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT
-    );
-    let node;
-    while ((node = walker.nextNode())) {
-      const lower = node.textContent.toLowerCase();
-      for (const key of MODEL_KEYS) {
-        if (!lower.includes(key) || found[key]) continue;
-        // Walk up looking for a $ amount in the same row/card.
-        let scope = node.parentElement;
-        for (let i = 0; i < 5 && scope; i++) {
-          const text = scope.textContent;
-          // Be careful: the scope might contain multiple model names + $.
-          // Only accept if exactly one model name appears in this scope.
-          const modelHits = MODEL_KEYS.filter((k) =>
-            text.toLowerCase().includes(k)
-          );
-          if (modelHits.length === 1 && modelHits[0] === key) {
-            const m = text.match(/\$([0-9]+(?:\.[0-9]+)?)/);
-            if (m) {
-              found[key] = parseFloat(m[1]);
-              break;
-            }
-          }
-          scope = scope.parentElement;
-        }
-      }
-    }
-    return Object.keys(found).length ? found : null;
-  }
-
-  // Fallback: programmatically hover the donut chart canvas at many
-  // angles, read the tooltip text after each hover.
-  async function readPerModelByHover() {
-    const canvas = document.querySelector('canvas[role="img"]');
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width < 20 || rect.height < 20) return null;
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const r = Math.min(rect.width, rect.height) / 2 * 0.7;
-
-    const found = {};
-    const samples = 36;
-    for (let i = 0; i < samples; i++) {
-      const angle = (i / samples) * 2 * Math.PI;
-      const x = cx + Math.cos(angle) * r;
-      const y = cy + Math.sin(angle) * r;
-      for (const type of ["pointermove", "mousemove"]) {
-        canvas.dispatchEvent(
-          new MouseEvent(type, {
-            clientX: x,
-            clientY: y,
-            bubbles: true,
-            cancelable: true,
-            view: window,
-          })
-        );
-      }
-      // Give Chart.js a tick to update tooltip content.
-      await new Promise((r) => setTimeout(r, 25));
-      const tooltip = document.querySelector('[role="tooltip"]');
-      if (!tooltip) continue;
-      const txt = tooltip.textContent;
-      const modelMatch = txt.match(/Claude\s+(Opus|Sonnet|Haiku)/i);
-      const dollarMatch = txt.match(/\$([0-9]+(?:\.[0-9]+)?)/);
-      if (modelMatch && dollarMatch) {
-        const key = modelMatch[1].toLowerCase();
-        if (found[key] == null) found[key] = parseFloat(dollarMatch[1]);
-      }
-    }
-    // Reset hover so we don't leave the page in a hovered state.
-    canvas.dispatchEvent(
-      new MouseEvent("mouseleave", { bubbles: true, cancelable: true })
-    );
-    return Object.keys(found).length ? found : null;
-  }
-
   // -- Send loop -----------------------------------------------------------
 
+  // The cost block is keyed BY SERVICE, not by model: one total per provider, so
+  // adding Gemini (or anything else) later just means another writer putting its
+  // own key in here. The menu renders one row per key it finds and needs no change.
   async function buildPayload() {
-    const totalUSD = readTotal();
-    let perModel = readPerModelStatic();
-    if (!perModel) perModel = await readPerModelByHover();
-    if (totalUSD === null && !perModel) return null;
+    const total = readTotal();
+    if (total === null) return null;
     return {
       cost: {
-        totalUSD,
-        perModel: perModel || {},
+        claude: total,
         period: "month-to-date",
       },
       updatedAt: Date.now(),
@@ -149,6 +73,7 @@
   let inFlight = false;
   async function send() {
     if (inFlight) return;
+    if (!onCostPage()) return;
     if (Date.now() - lastSent < 5_000) return;
     const payload = await buildPayload();
     if (!payload) return;

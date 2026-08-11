@@ -1,17 +1,19 @@
 #!/bin/bash
-# Tells any running Chromium-based browser to reload only the exact pages the
-# extension scrapes — the Claude usage settings page and the API cost page.
-# We re-set the tab's URL to itself rather than calling `reload`, because
-# some browsers (notably Dia) don't expose a reload command on tabs but do
-# accept URL assignment, which triggers the same effect.
+# Tells any running Chromium-based browser to reload the one page the extension
+# still scrapes — the API cost page. We re-set the tab's URL to itself rather than
+# calling `reload`, because some browsers (notably Dia) don't expose a reload
+# command on tabs but do accept URL assignment, which triggers the same effect.
 #
 # After firing the reload, we poll the local server for a fresh updatedAt
 # timestamp so SwiftBar re-renders as soon as new data arrives.
+#
+# The Claude usage page used to be reloaded here too, every 60s. Usage now comes
+# straight from the OAuth API in the plugin, so that tab is no longer needed at
+# all. Month-to-date spend moves slowly, so this runs every 30 min (see
+# io.claude-usage.refresh.plist) rather than every minute.
 
-# Tabs we will reload. Match on prefix so query strings / trailing slashes
-# don't break the check, but reject unrelated claude.ai pages (chats, etc.)
-# so we don't reload work the user has open.
-USAGE_URL="https://claude.ai/settings/usage"
+# Tab we will reload. Match on prefix so query strings / trailing slashes don't
+# break the check, but reject unrelated pages so we don't reload the user's work.
 COST_URL="https://platform.claude.com/workspaces/default/cost"
 
 reload_in() {
@@ -25,7 +27,7 @@ reload_in() {
         repeat with t in tabs of w
           try
             set u to URL of t
-            if (u starts with "$USAGE_URL") or (u starts with "$COST_URL") then
+            if u starts with "$COST_URL" then
               set URL of t to u
             end if
           end try

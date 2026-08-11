@@ -1,23 +1,62 @@
 # Claude Usage Menu Bar
 
-A tiny three-piece system that surfaces your [Claude.ai](https://claude.ai) session and weekly usage limits in your macOS menu bar.
+Surfaces your Claude session and weekly usage limits in your macOS menu bar.
 
 ```
-Chrome extension  ──POST──▶  localhost:7823  ──GET──▶  SwiftBar
-(scrapes claude.ai)        (Node.js, ~50 LOC)        (bash plugin)
+extension (any claude.ai tab) ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
+  usage.js  → plan usage, every 60s      (Node.js, ~50 LOC)     (bash plugin)
+  cost.js   → API spend                                              │
+                                                                     │
+Claude OAuth usage API ─────────────GET (fallback, ≤1 per 5 min)─────┘
 ```
 
-The extension scrapes the visible numbers from Claude's settings UI (it does not call any private API), the Node server caches the latest payload, and SwiftBar polls the cache once every 30 seconds.
+**Usage numbers** have two sources, and the plugin prefers whichever is fresher:
+
+1. **`usage.js`** runs in any open claude.ai tab and calls claude.ai's own
+   cookie-authenticated `/api/organizations/<org>/usage` — the exact endpoint the
+   Settings → Usage page hits when you press its Refresh button — once a minute, POSTing
+   the result to the local server. **This is the only way to get per-minute updates.**
+2. **The OAuth API** (`api.anthropic.com/api/oauth/usage`) is the fallback for when no
+   claude.ai tab is open. It needs no browser at all, authenticating with Claude Code's
+   keychain token.
+
+Both return an **identical payload shape**, so the plugin parses either with the same
+code. Both give absolute `resets_at` timestamps rather than text like "Resets in 1 hr".
+
+The OAuth endpoint cannot be polled every 60s — it is aggressively rate-limited and
+shared with Claude Code and the Claude desktop app. Measured: 0 successes in 7 attempts
+at a 60s cadence, and roughly 1 in 3 once traffic settled, i.e. about one call every
+three minutes across all consumers. So the plugin only calls it when nothing has pushed
+recently and its cache is older than `USAGE_TTL` (default 300s). If a call fails, the
+last good payload is served for up to 30 minutes and the footer is marked `(cached)`.
+
+**Practical upshot:** keep any claude.ai tab open and you get 60s updates. Close them all
+and it degrades to ~5-minute updates rather than breaking.
+
+**API cost figures** are the one thing that endpoint does not expose (its `spend` field
+is prepaid credits, a different number), so those still come from a content script that
+scrapes the Claude console into a small local Node server. Month-to-date spend moves
+slowly, so that page is reloaded every 30 minutes.
+
+The extension and the local server are optional: without them the menu bar still works
+from the OAuth API alone, just at ~5-minute resolution and with no API Cost rows.
+
+> **Note:** the usage endpoint is internal and undocumented (its payload carries
+> codenamed fields), so it may change without notice.
 
 ---
 
 ## Prerequisites
 
 - macOS
-- [Node.js](https://nodejs.org) (any modern version; only the standard library is used)
 - [SwiftBar](https://github.com/swiftbar/SwiftBar)
+- [Claude Code](https://claude.com/claude-code), logged in — the plugin reads its OAuth token from the keychain (service `Claude Code-credentials`) to call the usage API.
+- `python3` (ships with macOS) — used to parse the API payload.
+
+Needed for per-minute usage updates and the optional **API Cost** rows:
+
+- [Node.js](https://nodejs.org) (any modern version; only the standard library is used)
 - Google Chrome (or any Chromium-based browser that supports MV3 unpacked extensions)
-- `jq` is recommended for the SwiftBar plugin but **not required** — it falls back to `python3` automatically.
 - **For the crisp vector pie-chart icon:** `librsvg` and `imagemagick` (both via Homebrew: `brew install librsvg imagemagick`). Without `librsvg`, the script falls back to a slightly fuzzier 14×14 raster icon.
 
 ---
@@ -67,19 +106,24 @@ To uninstall: `launchctl unload ~/Library/LaunchAgents/io.claude-usage.server.pl
 
 ---
 
-## 2. Install the Chrome extension
+## 2. Install the Chrome extension (needed for 60s updates)
+
+Skip only if ~5-minute usage updates are fine and you don't want the API Cost rows.
 
 1. Open `chrome://extensions`.
 2. Toggle **Developer mode** (top right).
 3. Click **Load unpacked** and select the `extension/` folder.
-4. Open [claude.ai](https://claude.ai) and navigate to **Settings → Usage** (or wherever the "Plan usage limits" / "Weekly limits" cards are visible). The extension scrapes whatever is currently in the DOM.
+4. Keep **any** claude.ai tab open — `usage.js` pushes plan usage from there every 60s.
+   It does not have to be the usage settings page; any claude.ai page works.
+5. For the API Cost rows, also open
+   <https://platform.claude.com/workspaces/default/cost> and leave that tab open.
 
-The content script:
+`usage.js` calls claude.ai's own `/api/organizations/<org>/usage` and POSTs the JSON
+verbatim. With several claude.ai tabs open, a `localStorage` lease elects a single poller
+so it stays at one request per minute in total, not one per tab.
 
-- Finds the `h3` headed **"Plan usage limits"** and **"Weekly limits"**.
-- Reads each `[role="progressbar"]`'s `aria-valuenow`.
-- Reads the adjacent `span.whitespace-nowrap.text-footnote.text-secondary` for the reset string.
-- POSTs to `http://localhost:7823/usage` every 60 s and on DOM mutation (debounced to ≥ 5 s).
+`cost.js` scrapes month-to-date spend from the console page and POSTs it as `cost.claude`.
+A LaunchAgent reloads that tab every 30 minutes (see INSTALL.md).
 
 Verify:
 
@@ -87,7 +131,31 @@ Verify:
 curl -s http://localhost:7823/usage | jq
 ```
 
-You should see your real percentages.
+You should see a `usage` object with a recent `usageUpdatedAt` (from `usage.js`) and, if
+you opened the console tab, a `cost` object:
+
+```bash
+curl -s http://localhost:7823/usage \
+  | jq '{sessionPct: .usage.five_hour.utilization,
+         pushedSecondsAgo: (now - (.usageUpdatedAt / 1000) | floor),
+         cost}'
+```
+
+`pushedSecondsAgo` should stay under 60. If it climbs past ~150 the plugin stops trusting
+the push and falls back to the OAuth API — check that a claude.ai tab is actually open.
+
+To exercise the fallback path directly:
+
+```bash
+TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])")
+curl -s -o /dev/null -w '%{http_code}\n' https://api.anthropic.com/api/oauth/usage \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  -H "User-Agent: claude-cli/2.1.227 (external, cli)"
+```
+
+A `429` here is normal and expected — it is why `usage.js` exists.
 
 ---
 
@@ -105,25 +173,61 @@ ln -sf "$HOME/Projects/claude-usage-menubar/swiftbar/claude-usage.60s.sh" \
 # 3. Refresh SwiftBar (menu bar → SwiftBar → Refresh All)
 ```
 
-The filename's `.30s.` suffix tells SwiftBar to re-run it every 30 seconds.
+The filename's `.60s.` suffix tells SwiftBar to re-run it every 60 seconds.
 
 ### What you'll see
 
-**Menu bar:** `☁ 33%` — current session percent, or `☁ --` if there is no data yet.
+**Menu bar:** a pie-chart icon showing elapsed session time, plus the session percent
+(`24%`), or `--` if there is no data yet.
 
-**Dropdown:**
+**Dropdown** (section headers render as colored pills, usage rows as bars):
 
 ```
-Session: 33% – Resets in 1 hr 51 min
+Claude
+24%                      ← 5-hour session
+↻ 1h 21m ( 2:00 PM )
+7%                       ← weekly, all models
+↻ Tue 1:00 AM
+
+Fable
+6%
+
+Codex
+0%
+↻ 4h 12m ( 5:31 PM )
+
+API Cost
+Claude: $101.42
 ---
-Weekly – All Models: 38% – Resets Tue 12:59 AM
-Weekly – Sonnet: 37% – Resets Tue 1:00 AM
-Weekly – Design: 0%
----
-Last updated: 2 min ago
-Open Claude.ai
-Refresh
+Last Updated: 2 min ago
 ```
+
+Per-model weekly rows (Sonnet, Opus, Design) appear automatically when the API reports
+them.
+
+**API Cost is one row per service, never per model.** The renderer emits a row for every
+numeric key it finds under `cost` in the local server payload, sorted by name, so adding
+another provider needs no code change here — just POST it:
+
+```bash
+curl -X POST localhost:7823/usage -H 'Content-Type: application/json' \
+  -d '{"cost":{"gemini":37.50},"updatedAt":'"$(date +%s)"'000}'
+```
+
+That renders `Gemini: $37.50` beneath `Claude:`. The server shallow-merges top-level keys,
+so each writer must POST the whole `cost` object it owns.
+
+### What "Last Updated" refers to
+
+| Footer | Meaning |
+|---|---|
+| *(absent)* | Usage was just fetched and there is no cost data. Nothing is stale. |
+| `Last Updated: N min ago` | Usage is live; `N` is the age of the **scraped cost** figure. |
+| `Last Updated: N min ago` (usage in-TTL) | Usage is `N` minutes old — reused from cache within its normal refresh interval. |
+| `Last Updated: N min ago (cached)` | A fetch was **attempted and failed**; usage is `N` minutes old and degraded. |
+
+The `(cached)` suffix is the signal that something is wrong. Without it, the menu is
+operating normally.
 
 ---
 
@@ -132,22 +236,27 @@ Refresh
 ```
 claude-usage-menubar/
 ├── README.md
-├── extension/
+├── extension/                          # 60s usage pushes + API Cost rows
 │   ├── manifest.json
-│   └── content.js
+│   ├── usage.js                        # pushes plan usage from any claude.ai tab
+│   └── cost.js                         # scrapes platform.claude.com spend
 ├── server/
 │   ├── server.js
-│   └── io.claude-usage.server.plist   # template — see install steps
+│   ├── io.claude-usage.server.plist    # template — see install steps
+│   └── io.claude-usage.refresh.plist   # template — 30 min cost-tab reload
 └── swiftbar/
-    └── claude-usage.60s.sh
+    ├── claude-usage.60s.sh             # menu bar plugin; calls the usage API
+    └── refresh-usage.sh                # reloads the cost tab
 ```
 
 ---
 
 ## Troubleshooting
 
-- **Menu bar shows `☁ --`** — either the server is down (`curl http://localhost:7823/usage`) or the extension hasn't reported yet (open `claude.ai` settings).
-- **`curl` returns `{}`** — the extension isn't reaching the server. Check Chrome DevTools → Console on `claude.ai`; look for `Failed to fetch` against `localhost:7823`.
+- **"No Claude Code credentials in keychain"** — the plugin couldn't read the OAuth token. Confirm Claude Code is logged in and that `security find-generic-password -s "Claude Code-credentials" -w` returns JSON.
+- **"Could not reach the usage API"** — the token was found but the call failed. Most often the token expired and Claude Code hasn't refreshed it yet; run any Claude Code command and it renews. Reproduce with the `curl` in §2.
+- **Usage percentages are right but API Cost rows are missing** — that's the extension half. Check the server (`curl http://localhost:7823/usage`) and that a `platform.claude.com/workspaces/*/cost` tab is open. Note the payload must use per-service keys (`cost.claude`); the older `cost.totalUSD` shape is ignored.
+- **Footer stuck on `(cached)`** — the usage API keeps failing. Usually HTTP 429 from too many calls; raise `USAGE_TTL` in the plugin. Check the live status with the `curl` in §2.
+- **Reloading the extension didn't take effect** — Chromium leaves already-injected content scripts running in open tabs after an extension reload. Reload or close the affected tabs too.
 - **Extension can't reach localhost** — verify `host_permissions` includes `http://localhost:7823/*` in `manifest.json` and that you reloaded the extension after editing.
-- **Reset strings look wrong** — Claude occasionally renames classes. Update `RESET_SELECTOR` in `extension/content.js`.
 - **Server won't start as LaunchAgent** — check `~/Library/Logs/claude-usage-server.log`. Most often the `node` path in the plist is wrong; rerun the `sed` step from §1.

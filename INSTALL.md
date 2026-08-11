@@ -4,25 +4,56 @@
 
 ## What this is
 
-A three-piece system that surfaces Claude.ai session and weekly usage limits (and optional Anthropic API costs) in the macOS menu bar via [SwiftBar](https://github.com/swiftbar/SwiftBar).
+Surfaces Claude session and weekly usage limits (and optional Anthropic API costs) in the macOS menu bar via [SwiftBar](https://github.com/swiftbar/SwiftBar).
 
 ```
-Chrome extension  ──POST──▶  localhost:7823  ──GET──▶  SwiftBar
-(scrapes claude.ai)        (Node.js, ~50 LOC)        (bash plugin)
+extension (any claude.ai tab) ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
+  usage.js  → plan usage, every 60s      (Node.js, ~50 LOC)     (bash plugin)
+  cost.js   → API spend                                              │
+                                                                     │
+Claude OAuth usage API ─────────────GET (fallback, ≤1 per 5 min)─────┘
 ```
 
-Plus two LaunchAgents: one keeps the Node server alive, one auto-reloads the relevant browser tab(s) every 60s so the scrape stays fresh.
+**Usage** has two sources. `usage.js` runs in any open claude.ai tab and calls claude.ai's
+own `/api/organizations/<org>/usage` every 60s — this is the only way to get per-minute
+updates. The OAuth API (`api.anthropic.com`, Claude Code's keychain token) is the fallback
+when no tab is open; it is rate-limited to roughly one call every three minutes across all
+consumers, so it cannot drive a 60s cadence on its own. Both return the same payload shape.
+
+**API cost** is the one figure that endpoint doesn't expose, so it still comes from a
+content script scraping the Claude console into a small local Node server.
+
+That split matters for install: **the extension, the Node server, and both LaunchAgents
+are needed for per-minute usage updates and the API Cost rows.** Without them the menu
+still works from the OAuth API alone at ~5-minute resolution; in that case only step 3
+(the SwiftBar plugin) is required — skip steps 1, 2, and the refresh agent entirely. Ask
+the user which they want before installing anything.
+
+The two LaunchAgents: one keeps the Node server alive, one reloads the console cost tab
+every 30 minutes.
 
 ## Prerequisites — confirm with the user before installing anything
 
 The user must already have, or be willing to install:
 
 - **macOS** (the SwiftBar plugin uses BSD `date`; ImageMagick `magick` and `rsvg-convert` are macOS Homebrew tools).
-- **Node.js** (any modern version — only the standard library is used). Check with `which node`. If missing, suggest `brew install node` and **wait for confirmation** before running it.
 - **[SwiftBar](https://github.com/swiftbar/SwiftBar)** — open the App Store link or `brew install --cask swiftbar`. The user must launch it once and grant permissions.
-- **A Chromium-based browser** (Chrome, Dia, Arc, Brave) where the user is logged into claude.ai.
-- **Recommended**: `jq` (`brew install jq`) — falls back to `python3` automatically if missing.
+- **Claude Code, logged in.** The plugin reads its OAuth token from the keychain. Verify with the command below — it must print JSON, not an error.
 - **Recommended for the crisp pie-chart icon**: `librsvg` and `imagemagick` (`brew install librsvg imagemagick`). Without `librsvg`, the script falls back to a fuzzier 14×14 raster icon.
+
+For per-minute usage updates and the optional API Cost rows:
+
+- **Node.js** (any modern version — only the standard library is used). Check with `which node`. If missing, suggest `brew install node` and **wait for confirmation** before running it.
+- **A Chromium-based browser** (Chrome, Dia, Arc, Brave) where the user is logged into claude.ai (for usage) and the Claude console (for cost).
+
+Verify the keychain token is readable:
+
+```bash
+security find-generic-password -s "Claude Code-credentials" -w \
+  | python3 -c "import json,sys; d=json.load(sys.stdin)['claudeAiOauth']; print('token ok, expires', d['expiresAt'])"
+```
+
+If that fails, the plugin cannot fetch usage — have the user log in to Claude Code first.
 
 Run a single batched check first:
 
@@ -74,7 +105,7 @@ Server logs land at `~/Library/Logs/claude-usage-server.log`.
 
 ## Step 2 — Install the auto-refresh helper + LaunchAgent
 
-This is the AppleScript-driven helper that reloads the user's open `claude.ai/settings/usage` and `platform.claude.com/workspaces/default/cost` tabs every 60s, so the scrape stays fresh. It only touches those two exact URLs — other claude.ai tabs (chats, projects) are left alone.
+This is the AppleScript-driven helper that reloads the user's open `platform.claude.com/workspaces/default/cost` tab every 30 minutes, so the cost scrape stays fresh. It only touches that one URL prefix — every other tab is left alone. Skip this agent entirely if the user isn't installing the API Cost rows.
 
 Note that each run walks every tab of every window across four browsers, one Apple Event per tab. With many tabs open that is slow: measured 7.8s for 60 tabs in Dia and 3.0s in Chrome, ~11s total per run. It blocks the browsers' main threads, not the whole system, so it does not stall the menu bar — but it is the first thing to look at if the browser itself feels sticky.
 
@@ -103,8 +134,13 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 1. Open `chrome://extensions` (or the equivalent in Dia/Arc/Brave).
 2. Toggle **Developer mode** in the top right.
 3. Click **Load unpacked** and select the `extension/` folder inside this project.
-4. Open <https://claude.ai/settings/usage> and leave the tab open. The content script scrapes whatever's in the DOM and POSTs to `localhost:7823`.
-5. (Optional) For API cost data, also open <https://platform.claude.com/workspaces/default/cost>.
+4. Open <https://platform.claude.com/workspaces/default/cost> and leave the tab open. `cost.js` scrapes the month-to-date total from it and POSTs it as `cost.claude` to `localhost:7823`.
+
+Costs are tracked **per service, one row each** — never broken down by model. Any writer can add a provider by POSTing its own key (`cost.gemini`, …); the menu renders a row per numeric key it finds and needs no change.
+
+Note for reloads: Chromium keeps already-injected content scripts running in open tabs after an extension reload. After reloading the extension, also reload or close any affected tabs, or the old script keeps posting.
+
+There is no longer a claude.ai tab to open — usage comes from the API.
 
 Verify after they've loaded the extension and opened the page:
 
@@ -112,15 +148,8 @@ Verify after they've loaded the extension and opened the page:
 curl -s http://localhost:7823/usage | jq
 ```
 
-Should show real percentages within a few seconds.
-
-The content script:
-
-- Finds `h3` headings starting with **"Plan usage limits"** and **"Weekly limits"**.
-- Reads each `[role="progressbar"]`'s `aria-valuenow`.
-- Reads the adjacent `span.whitespace-nowrap.text-footnote.text-secondary` for the reset string.
-- POSTs every 60s and on DOM mutation (debounced to ≥ 5s).
-- Skips POSTing if the session bar is found but has no reset string (defends against accidentally overwriting good data when a different account's tab is also open).
+Should show a `cost` object within a few seconds. Usage percentages will **not** appear
+here; that's expected.
 
 ## Step 4 — Install the SwiftBar plugin
 
@@ -154,12 +183,9 @@ Opus: 12% Used
 Design: 0% Used
 ---
 API Cost – Month to Date
-All Models: $2.63
-Opus: $2.49
-Sonnet: $0.10
-Haiku: $0.04
+Claude: $101.42
 ---
-Last updated: just now
+Last Updated: 2 min ago
 ```
 
 (The cost block only appears if the user opened `platform.claude.com/workspaces/default/cost` and the cost-scraper script ran.)
@@ -172,7 +198,8 @@ claude-usage-menubar/
 ├── README.md                             # original / longform reference
 ├── extension/
 │   ├── manifest.json
-│   ├── content.js                        # scrapes claude.ai usage page
+│   ├── usage.js                          # pushes plan usage from any claude.ai tab
+│   ├── cost.js                           # scrapes console month-to-date spend
 │   ├── cost.js                           # scrapes platform.claude.com cost page
 │   └── icons/
 ├── server/
@@ -209,9 +236,10 @@ bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.60s.sh" | 
 
 ## Troubleshooting
 
-- **Menu bar stuck on `--`** — the server is up but the extension hasn't reported. Have the user open <https://claude.ai/settings/usage> and check `chrome://extensions` for any errors on the `Claude Usage Reporter` extension.
+- **Menu bar stuck on `--`, or "No Claude Code credentials in keychain"** — the plugin couldn't read the OAuth token. Confirm Claude Code is logged in and rerun the `security find-generic-password` check from Prerequisites.
+- **"Could not reach the usage API"** — token found but the call failed, usually an expired token that Claude Code hasn't refreshed yet. Running any Claude Code command renews it. The plugin deliberately never uses the refresh token itself, to avoid racing Claude Code's own session.
 - **`curl` returns `{}` indefinitely** — extension can't reach localhost. Check Chrome DevTools → Console on `claude.ai` for `Failed to fetch` errors against `localhost:7823`. Verify the manifest still has `http://localhost:7823/*` in `host_permissions` and reload the extension.
 - **Menu bar values flip between two readings** — the user has tabs in two different Claude accounts open, both POSTing. The content script is supposed to skip POSTing when the session bar has no reset countdown, but if both have valid data, the user must close one of the duplicates. Look for incoming POSTs by tailing the server log and watch `state.json` for ~30s to identify the rogue tab.
-- **Reset times are wrong / missing** — Claude occasionally renames Tailwind classes. Update `RESET_SELECTOR` in `extension/content.js` to match whatever class chain the reset span currently uses.
-- **Auto-refresh isn't reloading the tab** — check `~/Library/Logs/claude-usage-refresh.log`. The most common cause is missing **Automation** permission for the browser app under System Settings → Privacy & Security → Automation. Also make sure the user actually has a tab open at exactly `claude.ai/settings/usage` (not, say, `claude.ai/settings`) — the helper only matches the full prefix.
+- **Reset times are wrong / missing** — these now come from the API's absolute `resets_at` timestamps, so a wrong time means either a system clock problem or an API shape change. Inspect the raw payload with the `curl` in README §2.
+- **Auto-refresh isn't reloading the cost tab** — check `~/Library/Logs/claude-usage-refresh.log`. The most common cause is missing **Automation** permission for the browser app under System Settings → Privacy & Security → Automation. Also make sure a tab is open at exactly `platform.claude.com/workspaces/default/cost` — the helper only matches that full prefix.
 - **Server LaunchAgent won't start** — check `~/Library/Logs/claude-usage-server.log`. The `node` path baked into the plist may be wrong; rerun the `sed` step from §1 with the correct `which node` output.

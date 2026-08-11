@@ -2,7 +2,7 @@
 # <xbar.title>Claude Usage</xbar.title>
 # <xbar.version>v1.2</xbar.version>
 # <xbar.author>local</xbar.author>
-# <xbar.desc>Shows Claude.ai session and weekly usage limits.</xbar.desc>
+# <xbar.desc>Shows Claude session and weekly usage limits from the OAuth usage API.</xbar.desc>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
@@ -11,9 +11,8 @@
 # refreshOnOpen intentionally omitted: it makes SwiftBar re-run this whole script
 # (curl + ~19 image builds) synchronously before drawing the dropdown, causing a
 # multi-second lag on every click. Without it the menu opens instantly from the
-# last background refresh (data is at most one 60s cycle stale). The extension
-# only POSTs fresh data every 60s, so refreshing faster than that is wasted work
-# -- hence the 60s filename interval.
+# last background refresh (data is at most one 60s cycle stale). A 60s cadence is
+# plenty for a 5-hour usage window, hence the 60s filename interval.
 
 # SwiftBar runs plugins with a minimal PATH; add Homebrew so `magick`, `jq`,
 # and other tools installed via brew are discoverable.
@@ -86,72 +85,215 @@ svg_to_b64() {
   fi
 }
 
-ENDPOINT="http://localhost:7823/usage"
+# --- Cost + pushed usage: read the local server first ---
+# The usage endpoint carries no console spend figure -- its `spend` field is
+# prepaid credits, a different number -- so the API Cost rows still come from
+# cost.js scraping platform.claude.com into the local server. Month-to-date spend
+# moves slowly, so that page is reloaded every 30 min (see refresh-usage.sh)
+# rather than every 60s like the old usage scrape.
+COST_JSON=$(curl -fsS --max-time 2 "http://localhost:7823/usage" 2>/dev/null)
 
-JSON=$(curl -fsS --max-time 2 "$ENDPOINT" 2>/dev/null)
-
-# Extract every field we need in ONE pass. Previously each field shelled out to
-# its own `jq` (16 subprocesses per render); now a single jq (or python fallback)
-# emits all values, one per line in a fixed order, with a blank line for any
-# missing/null field so the read block below stays aligned.
-read_fields() {
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$JSON" | jq -r '
-      [ .session.pct, .session.reset,
-        .weekly.allModels.pct, .weekly.allModels.reset,
-        .weekly.sonnet.pct, .weekly.sonnet.reset,
-        .weekly.design.pct, .weekly.design.reset,
-        .weekly.opus.pct, .weekly.opus.reset,
-        .weekly.fable.pct,
-        .cost.totalUSD, .cost.perModel.opus, .cost.perModel.sonnet, .cost.perModel.haiku,
-        .updatedAt
-      ] | map(if . == null then "" else . end) | .[]' 2>/dev/null
-  else
-    printf '%s' "$JSON" | python3 -c "
-import json, sys
+# --- Preferred usage source: pushed by the extension ---
+# usage.js (running in any claude.ai tab) calls claude.ai's own cookie-authenticated
+# /api/organizations/<org>/usage once a minute and POSTs the result here. That is the
+# ONLY way to get per-minute usage: the OAuth API below is rate-limited to roughly one
+# call every three minutes across all its consumers (this plugin, Claude Code, and the
+# Claude desktop app), so polling it every 60s just returns 429.
+#
+# The two endpoints return an identical payload shape, so whichever wins is parsed by
+# exactly the same code below. If nothing has pushed recently -- no claude.ai tab open,
+# browser closed -- we fall through to the OAuth API on its slower TTL.
+USAGE_PUSH_MAX=150
+PUSHED_USAGE=""
+PUSHED_AGE=0
+if [ -n "$COST_JSON" ]; then
+  _pushed=$(printf '%s' "$COST_JSON" | python3 -c "
+import json, sys, time
 try:
     d = json.loads(sys.stdin.read() or '{}')
 except Exception:
     d = {}
-def g(*ks):
-    cur = d
+u, ts = d.get('usage'), d.get('usageUpdatedAt')
+if isinstance(u, dict) and u.get('five_hour') and isinstance(ts, (int, float)):
+    age = int(time.time() - ts / 1000)
+    if 0 <= age < $USAGE_PUSH_MAX:
+        print(age)
+        print(json.dumps(u))
+" 2>/dev/null)
+  if [ -n "$_pushed" ]; then
+    PUSHED_AGE=$(printf '%s' "$_pushed" | sed -n 1p)
+    PUSHED_USAGE=$(printf '%s' "$_pushed" | sed -n 2p)
+  fi
+fi
+
+# --- Usage: direct OAuth API call ---
+# The session/weekly numbers come straight from Claude's OAuth usage endpoint
+# rather than the browser extension. That drops the dependency on a claude.ai tab
+# staying open (and being force-reloaded every 60s) for the fastest-moving number
+# in the menu bar, and gives us absolute `resets_at` timestamps instead of scraped
+# relative text like "Resets in 1 hr 45 min".
+#
+# The bearer token is Claude Code's own OAuth token from the login keychain. It
+# rotates roughly hourly and Claude Code refreshes it on use, so re-reading the
+# keychain each render always picks up the current one. We deliberately do NOT
+# touch the refresh token -- refreshing here would race Claude Code's own session.
+#
+# This endpoint is internal and undocumented (the payload carries codenamed
+# fields like `tangelo` and `nimbus_quill`), so it can change without notice.
+API_URL="https://api.anthropic.com/api/oauth/usage"
+TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+
+# --- Fetch throttle + last-good cache ---
+# This endpoint rate-limits hard. Measured: one request per 60s returned HTTP 429
+# on 7 of 7 attempts over 7 minutes, with an unhelpful `retry-after: 0`. We are not
+# the only consumer -- Claude Code polls the same endpoint for its own status -- so
+# a 60s plugin poll simply does not fit in the budget.
+#
+# So: render every 60s as before, but only actually CALL the API when the cached
+# payload is older than USAGE_TTL. In between, the cached payload is reused. That
+# drops us from ~60 calls/hour to ~12 and leaves headroom for Claude Code.
+#
+# Separately, if a fetch fails we keep serving the last good payload up to
+# USAGE_STALE_MAX so a transient 429 never blanks a menu that was correct a minute
+# ago. Past that the numbers are too old to show and the error surfaces instead.
+#
+# This is NOT a fallback to the extension/localhost for usage -- that stays removed
+# by request. It is only this script re-using its own most recent API response.
+USAGE_CACHE="$HOME/.cache/claude-usage/usage.json"
+USAGE_TTL=300
+USAGE_STALE_MAX=1800
+
+_cache_age=999999
+if [ -f "$USAGE_CACHE" ]; then
+  _cache_age=$(( $(date +%s) - $(stat -f %m "$USAGE_CACHE" 2>/dev/null || echo 0) ))
+  [ "$_cache_age" -lt 0 ] && _cache_age=999999
+fi
+
+USAGE_JSON=""
+HTTP_CODE=""
+USAGE_AGE=0
+if [ -n "$PUSHED_USAGE" ]; then
+  # A claude.ai tab pushed within USAGE_PUSH_MAX: use it and make NO OAuth call at
+  # all this render. This is the normal path, and it is what makes 60s updates
+  # possible without touching the rate-limited endpoint.
+  USAGE_JSON="$PUSHED_USAGE"
+  USAGE_AGE="$PUSHED_AGE"
+elif [ -n "$TOKEN" ] && [ "$_cache_age" -ge "$USAGE_TTL" ]; then
+  _resp=$(curl -sS -w $'\n%{http_code}' --max-time 4 "$API_URL" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "User-Agent: claude-cli/2.1.227 (external, cli)" 2>/dev/null)
+  HTTP_CODE="${_resp##*$'\n'}"
+  [ "$HTTP_CODE" = "200" ] && USAGE_JSON="${_resp%$'\n'*}"
+fi
+
+if [ -n "$USAGE_JSON" ]; then
+  printf '%s' "$USAGE_JSON" > "$USAGE_CACHE.$$" && mv -f "$USAGE_CACHE.$$" "$USAGE_CACHE"
+elif [ -f "$USAGE_CACHE" ] && [ "$_cache_age" -lt "$USAGE_STALE_MAX" ]; then
+  USAGE_JSON=$(cat "$USAGE_CACHE" 2>/dev/null)
+  USAGE_AGE="$_cache_age"
+fi
+
+# Extract every field from BOTH payloads in ONE pass, one value per line in a
+# fixed order, blank for anything missing, so the read block below stays aligned.
+# This is python-only rather than the previous jq-first split: the API returns ISO
+# timestamps that need real date parsing, which jq's fromdateiso8601 will not take
+# with fractional seconds and a +00:00 offset. It is still a single subprocess.
+# The two payloads are fed on one stdin separated by a 0x1F record separator.
+read_fields() {
+  printf '%s\n\037\n%s' "$USAGE_JSON" "$COST_JSON" | python3 -c "
+import json, sys
+from datetime import datetime
+
+raw = sys.stdin.read().split('\n\037\n')
+def load(i):
+    try:
+        return json.loads(raw[i]) if i < len(raw) and raw[i].strip() else {}
+    except Exception:
+        return {}
+u, c = load(0), load(1)
+
+def epoch(iso):
+    # resets_at looks like 2026-08-11T20:00:00.651709+00:00
+    if not iso:
+        return ''
+    try:
+        return str(int(datetime.fromisoformat(iso).timestamp()))
+    except Exception:
+        return ''
+
+def win(name):
+    w = u.get(name)
+    return w if isinstance(w, dict) else {}
+
+def pct(w):
+    v = w.get('utilization')
+    return '' if v is None else str(int(round(v)))
+
+# Per-model weekly buckets arrive as weekly_scoped entries in limits[], keyed by
+# model display name. Build the map once so any model Anthropic adds later shows
+# up without another code change.
+scoped = {}
+for l in (u.get('limits') or []):
+    if not isinstance(l, dict) or l.get('kind') != 'weekly_scoped':
+        continue
+    name = (((l.get('scope') or {}).get('model') or {}).get('display_name') or '').lower()
+    if name:
+        scoped[name] = l
+
+def scoped_pct(name):
+    l = scoped.get(name)
+    if l and l.get('percent') is not None:
+        return str(int(round(l['percent'])))
+    # Fall back to the top-level seven_day_<model> window when present.
+    return pct(win('seven_day_' + name))
+
+def cget(*ks):
+    cur = c
     for k in ks:
         cur = cur.get(k) if isinstance(cur, dict) else None
-        if cur is None: return ''
+        if cur is None:
+            return ''
     return cur
+
+five, seven = win('five_hour'), win('seven_day')
 rows = [
-    g('session','pct'), g('session','reset'),
-    g('weekly','allModels','pct'), g('weekly','allModels','reset'),
-    g('weekly','sonnet','pct'), g('weekly','sonnet','reset'),
-    g('weekly','design','pct'), g('weekly','design','reset'),
-    g('weekly','opus','pct'), g('weekly','opus','reset'),
-    g('weekly','fable','pct'),
-    g('cost','totalUSD'), g('cost','perModel','opus'), g('cost','perModel','sonnet'), g('cost','perModel','haiku'),
-    g('updatedAt'),
+    pct(five), epoch(five.get('resets_at')),
+    pct(seven), epoch(seven.get('resets_at')),
+    scoped_pct('sonnet'),
+    scoped_pct('opus'),
+    scoped_pct('design'),
+    scoped_pct('fable'),
+    # Cost is keyed by SERVICE (claude, gemini, ...), one row each -- never by
+    # model. Emit every numeric key as name=value joined by ';' so adding a new
+    # provider needs no change here or in the renderer. Sorted for stable order.
+    ';'.join(
+        '%s=%s' % (k, v)
+        for k, v in sorted((c.get('cost') or {}).items())
+        # 'totalUSD'/'perModel' are the pre-per-service payload shape; ignore them
+        # rather than render a stray 'TotalUSD:' row from a not-yet-reloaded script.
+        if k not in ('period', 'totalUSD', 'perModel')
+        and isinstance(v, (int, float))
+    ),
+    cget('updatedAt'),
 ]
 for r in rows:
     print('' if r is None else r)
 " 2>/dev/null
-  fi
 }
 
 {
   IFS= read -r SESSION_PCT
-  IFS= read -r SESSION_RESET
+  IFS= read -r RESET_EPOCH
   IFS= read -r WEEKLY_ALL_PCT
-  IFS= read -r WEEKLY_ALL_RESET
+  IFS= read -r WEEKLY_RESET_EPOCH
   IFS= read -r WEEKLY_SONNET_PCT
-  IFS= read -r WEEKLY_SONNET_RESET
-  IFS= read -r WEEKLY_DESIGN_PCT
-  IFS= read -r WEEKLY_DESIGN_RESET
   IFS= read -r WEEKLY_OPUS_PCT
-  IFS= read -r WEEKLY_OPUS_RESET
+  IFS= read -r WEEKLY_DESIGN_PCT
   IFS= read -r WEEKLY_FABLE_PCT
-  IFS= read -r COST_TOTAL
-  IFS= read -r COST_OPUS
-  IFS= read -r COST_SONNET
-  IFS= read -r COST_HAIKU
-  IFS= read -r UPDATED_AT
+  IFS= read -r COST_SERVICES
+  IFS= read -r COST_UPDATED_AT
 } < <(read_fields)
 
 # Format a number as $XX.XX (or "-" if empty).
@@ -176,36 +318,22 @@ fmt_remaining() {
 }
 
 # --- Time-elapsed calculation for the pie chart ---
-# Claude sessions are 5-hour rolling windows, so 300 minutes total.
+# Claude sessions are 5-hour rolling windows, so 300 minutes total. The API hands
+# us an absolute reset timestamp, so elapsed time is just the remainder of that
+# window: no more parsing "Resets in 1 hr 45 min" out of scraped page text, and no
+# more anchoring the result to a scrape time that could already be a minute stale.
 SESSION_TOTAL_MIN=300
-
-# Parse "Resets in 1 hr 45 min" / "Resets in 45 min" / "Resets in 2 hr" -> minutes.
-parse_remaining_min() {
-  local s="$1"
-  local hr min
-  hr=$(echo "$s" | grep -oE '[0-9]+ hr' | head -1 | grep -oE '[0-9]+')
-  min=$(echo "$s" | grep -oE '[0-9]+ min' | head -1 | grep -oE '[0-9]+')
-  hr=${hr:-0}
-  min=${min:-0}
-  echo $((hr * 60 + min))
-}
 
 PIE_PCT=""
 SESSION_RESET_AT=""
-if [ -n "$SESSION_RESET" ]; then
-  REMAINING=$(parse_remaining_min "$SESSION_RESET")
-  if [ "$REMAINING" -gt 0 ] 2>/dev/null; then
+if [ -n "$RESET_EPOCH" ]; then
+  REMAINING=$(( (RESET_EPOCH - $(date +%s)) / 60 ))
+  if [ "$REMAINING" -gt 0 ]; then
     PIE_PCT=$(( (SESSION_TOTAL_MIN - REMAINING) * 100 / SESSION_TOTAL_MIN ))
     [ "$PIE_PCT" -lt 0 ]   && PIE_PCT=0
     [ "$PIE_PCT" -gt 100 ] && PIE_PCT=100
-    # Build the bare reset time "H:MM AM/PM" anchored to when the data was scraped,
-    # so the time stays correct regardless of when SwiftBar reads it.
-    if [ -n "$UPDATED_AT" ]; then
-      RESET_EPOCH=$(( UPDATED_AT/1000 + REMAINING*60 ))
-      RESET_TIME=$(date -r "$RESET_EPOCH" +"%-I:%M %p" 2>/dev/null)
-      [ -n "$RESET_TIME" ] && SESSION_RESET_AT="${RESET_TIME}"
-    fi
   fi
+  SESSION_RESET_AT=$(date -r "$RESET_EPOCH" +"%-I:%M %p" 2>/dev/null)
 fi
 
 # --- Codex usage (read from the local Codex CLI session logs) ---
@@ -449,10 +577,19 @@ generate_bar_b64() {
 # allow). The text is smaller than the default row font and sits high in a taller
 # canvas, so it reads as a caption tucked up under the bar above it.
 #   $1 = the full row text (glyph + times)
+# $2 = "volatile" when the text embeds a live countdown ("1h 21m"), which changes
+# every minute. Those images can never be reused -- next render's key is different --
+# so memoizing them is pure cost: a dead file written per render per row, unbounded
+# growth (measured 2069 files / 16MB after a day, 91% of the whole image cache), and
+# a daily-eviction `find` that then has to walk all of them. Volatile rows skip the
+# cache in both directions and just render. Static rows (a bare reset time, e.g.
+# "↻ Tue 1:00 AM") still memoize and hit essentially every time.
 generate_reset_b64() {
-  local text="$1"
-  local _f="$IMGCACHE/reset-${text//[^[:alnum:]]/_}"
-  [ -f "$_f" ] && { cat "$_f"; return; }
+  local text="$1" volatile="$2" _f=""
+  if [ "$volatile" != "volatile" ]; then
+    _f="$IMGCACHE/reset-${text//[^[:alnum:]]/_}"
+    [ -f "$_f" ] && { cat "$_f"; return; }
+  fi
   # Split the leading "↻ " glyph from the time text so the glyph can be drawn a bit
   # larger than the (smaller) time text.
   # Reload icon = the real ↻ (U+21BB) glyph from the macOS SF system font, but
@@ -479,7 +616,11 @@ generate_reset_b64() {
     '"$glyph"'
     <text x="'"$xrest"'" y="11.5" font-family="Helvetica" font-size="13" fill="#8a8a8a">'"$esc"'</text>
   </svg>'
-  svg_to_b64 "$svg" "$w" "$H" | tee "$_f"
+  if [ -n "$_f" ]; then
+    svg_to_b64 "$svg" "$w" "$H" | tee "$_f"
+  else
+    svg_to_b64 "$svg" "$w" "$H"
+  fi
 }
 
 # Has the session reset time passed since we last scraped? If so, the cached
@@ -506,7 +647,7 @@ fi
 TITLE_TEXT="--"
 if [ "$SESSION_EXPIRED" = "1" ]; then
   TITLE_TEXT="–"
-elif [ -n "$JSON" ] && [ -n "$SESSION_PCT" ]; then
+elif [ -n "$SESSION_PCT" ]; then
   TITLE_TEXT="${SESSION_PCT}%"
 fi
 
@@ -517,9 +658,13 @@ else
 fi
 echo "---"
 
-# Row suffixes. Every row is purely informational: no href/bash actions, so macOS
+# Row suffixes. Data rows are purely informational: no href/bash actions, so macOS
 # auto-disables the items and they are neither selectable (no hover highlight) nor
 # clickable. $G keeps just a grey color for the footer.
+#
+# The two section headers that have a page behind them -- Claude and API Cost -- do
+# carry an href, so those alone are clickable and highlight on hover. Fable and Codex
+# stay inert: Fable has no page of its own, and Codex is a local-file source.
 C=""
 CC=""
 CX=""
@@ -550,7 +695,7 @@ render_codex() {
       # Grey reload glyph, white time, grey "- <remaining>" (basic ANSI grey).
       codex_rem=$(fmt_remaining "$CODEX_RESET_EPOCH")
       if [ -n "$codex_rem" ]; then
-        echo " | image=$(generate_reset_b64 "↻ $codex_rem ( $CODEX_RESET_AT )") $CX"
+        echo " | image=$(generate_reset_b64 "↻ $codex_rem ( $CODEX_RESET_AT )" volatile) $CX"
       else
         echo " | image=$(generate_reset_b64 "↻ $CODEX_RESET_AT") $CX"
       fi
@@ -576,30 +721,36 @@ render_codex_weekly() {
   fi
 }
 
-if [ -z "$JSON" ]; then
-  echo "No data — is the local server running? | color=red"
-  echo "Open Claude.ai | $C"
+if [ -z "$USAGE_JSON" ]; then
+  # Only reached when the fetch failed AND there was no usable cached payload.
+  if [ -z "$TOKEN" ]; then
+    echo "No Claude Code credentials in keychain | color=red"
+  elif [ "$HTTP_CODE" = "429" ]; then
+    echo "Usage API rate-limited — will retry | color=red"
+  elif [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "000" ]; then
+    echo "Usage API error (HTTP $HTTP_CODE) | color=red"
+  else
+    echo "Could not reach the usage API | color=red"
+  fi
   render_codex
   exit 0
 fi
 
 # --- Claude block ---
-# Grey header line (no action), then white data rows. Prefer the absolute reset
-# time we computed above; fall back to whatever the page said ("Resets in ...").
+# Grey header line (no action), then white data rows. The reset time is always the
+# absolute one computed from the API timestamp; there is no scraped-text fallback.
 SESSION_HEADER_RESET="$SESSION_RESET_AT"
-[ -z "$SESSION_HEADER_RESET" ] && SESSION_HEADER_RESET="$SESSION_RESET"
 # Blue pill title (rendered as a full-color image; SwiftBar can't color a row bg).
-echo " | image=$(generate_label_b64 "Claude" "#3b82f6")"
+echo " | image=$(generate_label_b64 "Claude" "#3b82f6") href=\"https://claude.ai/new#settings/usage\""
 if [ -n "$SESSION_PCT" ]; then
   echo "${SESSION_PCT}% | image=$(generate_bar_b64 "$SESSION_PCT" "#3b82f6") size=12 $C"
 fi
 # Reset row: reload glyph, time, and live remaining, dimmed to 50% opacity.
-# Strip a leading "Resets " from the page-text fallback so it doesn't double up.
 if [ -n "$SESSION_HEADER_RESET" ]; then
-  reset_time="${SESSION_HEADER_RESET#Resets }"
+  reset_time="$SESSION_HEADER_RESET"
   rem=$(fmt_remaining "$RESET_EPOCH")
   if [ -n "$rem" ]; then
-    echo " | image=$(generate_reset_b64 "↻ $rem ( $reset_time )") $C"
+    echo " | image=$(generate_reset_b64 "↻ $rem ( $reset_time )" volatile) $C"
   else
     echo " | image=$(generate_reset_b64 "↻ $reset_time") $C"
   fi
@@ -616,12 +767,10 @@ wk_row() {
 wk_row "Sonnet" "$WEEKLY_SONNET_PCT"
 wk_row "Opus"   "$WEEKLY_OPUS_PCT"
 wk_row "Design" "$WEEKLY_DESIGN_PCT"
-WEEKLY_RESET="$WEEKLY_ALL_RESET"
-[ -z "$WEEKLY_RESET" ] && WEEKLY_RESET="$WEEKLY_SONNET_RESET"
-[ -z "$WEEKLY_RESET" ] && WEEKLY_RESET="$WEEKLY_OPUS_RESET"
-[ -z "$WEEKLY_RESET" ] && WEEKLY_RESET="$WEEKLY_DESIGN_RESET"
-if [ -n "$WEEKLY_RESET" ]; then
-  echo " | image=$(generate_reset_b64 "↻ ${WEEKLY_RESET#Resets }") $C"
+if [ -n "$WEEKLY_RESET_EPOCH" ]; then
+  weekly_reset_time=$(date -r "$WEEKLY_RESET_EPOCH" +"%a %-I:%M %p" 2>/dev/null)
+  [ -n "$weekly_reset_time" ] && \
+    echo " | image=$(generate_reset_b64 "↻ $weekly_reset_time") $C"
 fi
 
 # --- Fable block ---
@@ -636,31 +785,59 @@ fi
 render_codex
 
 # --- API Cost block ---
-# Show only if we have any cost data (otherwise the section is hidden).
-if [ -n "$COST_TOTAL$COST_OPUS$COST_SONNET$COST_HAIKU" ]; then
+# One row per SERVICE (Claude, Gemini, ...), never per model. COST_SERVICES arrives
+# as "claude=101.42;gemini=5" so a new provider appears here automatically once
+# something POSTs its key -- no change needed in this file.
+if [ -n "$COST_SERVICES" ]; then
   # A blank spacer row above the API Cost section (non-breaking space; see note
   # in render_codex).
   printf '\xc2\xa0\n'
   # Orange pill title (full-color image; see the Claude header note).
-  echo " | image=$(generate_label_b64 "API Cost" "#f97316")"
-  [ -n "$COST_TOTAL"  ] && echo "All Models: $(fmt_usd "$COST_TOTAL") | $CC"
-  [ -n "$COST_OPUS"   ] && echo "Opus: $(fmt_usd "$COST_OPUS") | $CC"
-  [ -n "$COST_SONNET" ] && echo "Sonnet: $(fmt_usd "$COST_SONNET") | $CC"
-  [ -n "$COST_HAIKU"  ] && echo "Haiku: $(fmt_usd "$COST_HAIKU") | $CC"
+  echo " | image=$(generate_label_b64 "API Cost" "#f97316") href=\"https://platform.claude.com/workspaces/default/cost\""
+  _old_ifs="$IFS"; IFS=';'
+  for _svc in $COST_SERVICES; do
+    _name="${_svc%%=*}"
+    _val="${_svc#*=}"
+    # "claude" -> "Claude". Service keys are lowercase by convention.
+    _label="$(printf '%s' "${_name:0:1}" | tr '[:lower:]' '[:upper:]')${_name:1}"
+    echo "${_label}: $(fmt_usd "$_val") | $CC"
+  done
+  IFS="$_old_ifs"
 fi
 
-echo "---"
-
-if [ -n "$UPDATED_AT" ]; then
+# Footer reports the age of whatever displayed data can actually be stale.
+#
+# Priority: a cached usage payload wins, because the session percentage is the
+# headline number and the one the menu bar itself shows -- if that is being served
+# from cache after a failed fetch, say so. Otherwise report the scraped cost age.
+# When usage is live and there is no cost data, nothing can be stale, so the footer
+# and its separator are omitted entirely.
+#
+# Gate the cost branch on the cost VALUES, not just on updatedAt: any content script
+# POSTing to the local server sets updatedAt, so keying off it alone made the footer
+# date a row that wasn't being rendered.
+fmt_age_min() {
+  case "$1" in
+    0) echo "just now" ;;
+    1) echo "1 min ago" ;;
+    *) echo "$1 min ago" ;;
+  esac
+}
+FOOTER=""
+if [ "$USAGE_AGE" -ge "$USAGE_TTL" ]; then
+  # Older than the refresh interval => a fetch was attempted and failed. Mark it,
+  # so a degraded menu is visibly different from one inside its normal TTL.
+  FOOTER="Last Updated: $(fmt_age_min $(( USAGE_AGE / 60 ))) (cached)"
+elif [ "$USAGE_AGE" -gt 0 ]; then
+  # Normal in-TTL reuse: the usage numbers are up to USAGE_TTL old, not live.
+  FOOTER="Last Updated: $(fmt_age_min $(( USAGE_AGE / 60 )))"
+elif [ -n "$COST_UPDATED_AT" ] && [ -n "$COST_SERVICES" ]; then
   NOW_MS=$(($(date +%s) * 1000))
-  DELTA_MIN=$(( (NOW_MS - UPDATED_AT) / 60000 ))
-  if [ "$DELTA_MIN" -le 0 ]; then
-    echo "Last updated: just now | $G"
-  elif [ "$DELTA_MIN" -eq 1 ]; then
-    echo "Last updated: 1 min ago | $G"
-  else
-    echo "Last updated: ${DELTA_MIN} min ago | $G"
-  fi
-else
-  echo "Last updated: unknown | $G"
+  DELTA_MIN=$(( (NOW_MS - COST_UPDATED_AT) / 60000 ))
+  [ "$DELTA_MIN" -lt 0 ] && DELTA_MIN=0
+  FOOTER="Last Updated: $(fmt_age_min "$DELTA_MIN")"
+fi
+if [ -n "$FOOTER" ]; then
+  echo "---"
+  echo "$FOOTER | $G"
 fi
