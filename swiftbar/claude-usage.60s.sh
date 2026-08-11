@@ -268,13 +268,19 @@ rows = [
     # Cost is keyed by SERVICE (claude, gemini, ...), one row each -- never by
     # model. Emit every numeric key as name=value joined by ';' so adding a new
     # provider needs no change here or in the renderer. Sorted for stable order.
+    # A null value is meaningful, not missing: the provider page rendered but has no
+    # figure yet (Gemini shows a dash until Google's billing pipeline reports, up to
+    # 24h later). Emit an empty value so the row still shows, as a dash -- printing 0
+    # would claim zero spend rather than not-known-yet.
+    # NB: no double quotes anywhere in this python block; it is embedded in a bash
+    # double-quoted string and a quote here silently truncates the whole parser.
     ';'.join(
-        '%s=%s' % (k, v)
+        '%s=%s' % (k, '' if v is None else v)
         for k, v in sorted((c.get('cost') or {}).items())
         # 'totalUSD'/'perModel' are the pre-per-service payload shape; ignore them
         # rather than render a stray 'TotalUSD:' row from a not-yet-reloaded script.
         if k not in ('period', 'totalUSD', 'perModel')
-        and isinstance(v, (int, float))
+        and (v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)))
     ),
     cget('updatedAt'),
 ]
@@ -798,9 +804,20 @@ if [ -n "$COST_SERVICES" ]; then
   for _svc in $COST_SERVICES; do
     _name="${_svc%%=*}"
     _val="${_svc#*=}"
-    # "claude" -> "Claude". Service keys are lowercase by convention.
-    _label="$(printf '%s' "${_name:0:1}" | tr '[:lower:]' '[:upper:]')${_name:1}"
-    echo "${_label}: $(fmt_usd "$_val") | $CC"
+    # Service keys are lowercase by convention. Capitalising the first letter is
+    # right for most of them ("claude" -> "Claude"), but not for names with
+    # internal capitals, so those get an explicit spelling.
+    case "$_name" in
+      openai) _label="OpenAI" ;;
+      *)      _label="$(printf '%s' "${_name:0:1}" | tr '[:lower:]' '[:upper:]')${_name:1}" ;;
+    esac
+    # Google reports Gemini spend on a delay of up to 24h, so this row can read
+    # $0.00 while spend is actually accruing. Say so on hover rather than letting
+    # the number quietly mislead. A tooltip adds no action, so the row stays inert.
+    _tip=""
+    [ "$_name" = "gemini" ] && \
+      _tip=' tooltip="Google reports Gemini spend with up to 24h delay"'
+    echo "${_label}: $(fmt_usd "$_val") | $CC$_tip"
   done
   IFS="$_old_ifs"
 fi

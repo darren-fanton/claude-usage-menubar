@@ -44,7 +44,17 @@ http
           // (claude.ai for usage, platform.claude.com for cost) can each
           // POST a partial payload without clobbering the other's data.
           const incoming = JSON.parse(body);
-          state = { ...(state || {}), ...incoming };
+          const prev = state || {};
+          const next = { ...prev, ...incoming };
+          // `cost` needs one more level of merging: it is written by several
+          // independent scrapers, one per service (cost.claude from the Claude
+          // console, cost.openai from the OpenAI dashboard). A top-level merge
+          // alone would let whichever posted last replace the whole object and
+          // wipe every other service's figure.
+          if (incoming.cost && typeof incoming.cost === "object") {
+            next.cost = { ...(prev.cost || {}), ...incoming.cost };
+          }
+          state = next;
           fs.writeFile(STATE_FILE, JSON.stringify(state), () => {});
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end('{"ok":true}');

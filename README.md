@@ -3,11 +3,13 @@
 Surfaces your Claude session and weekly usage limits in your macOS menu bar.
 
 ```
-extension (any claude.ai tab) ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
-  usage.js  → plan usage, every 60s      (Node.js, ~50 LOC)     (bash plugin)
-  cost.js   → API spend                                              │
-                                                                     │
-Claude OAuth usage API ─────────────GET (fallback, ≤1 per 5 min)─────┘
+extension content scripts ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
+  usage.js   → plan usage, any claude.ai tab, 60s                 (bash plugin)
+  cost.js    → Claude console spend                                    │
+  openai.js  → OpenAI project spend                                    │
+  gemini.js  → Gemini monthly spend                                    │
+                                                                       │
+Claude OAuth usage API ───────────GET (fallback, ≤1 per 5 min)─────────┘
 ```
 
 **Usage numbers** have two sources, and the plugin prefers whichever is fresher:
@@ -33,10 +35,26 @@ last good payload is served for up to 30 minutes and the footer is marked `(cach
 **Practical upshot:** keep any claude.ai tab open and you get 60s updates. Close them all
 and it degrades to ~5-minute updates rather than breaking.
 
-**API cost figures** are the one thing that endpoint does not expose (its `spend` field
-is prepaid credits, a different number), so those still come from a content script that
-scrapes the Claude console into a small local Node server. Month-to-date spend moves
-slowly, so that page is reloaded every 30 minutes.
+**API cost figures** come from per-service content scripts, one row per provider:
+
+| Row | Source | Figure |
+|---|---|---|
+| `Claude:` | `platform.claude.com/workspaces/*/cost` | month-to-date token cost |
+| `OpenAI:` | `platform.openai.com/settings/*/limits` | current project spend (the `$X` of `$X / $limit`) |
+| `Gemini:` | `aistudio.google.com/**/spend` | monthly spend from the "Monthly spend cap" card |
+
+> **Gemini lags.** Google states costs "take a few hours to show up, and might take longer
+> than 24 hours". Until the figure reports, the page shows `-` and the menu shows `Gemini: -`
+> rather than `$0.00` — "not reported yet" and "you spent nothing" must not look alike. The
+> row also carries a tooltip about the delay. A genuine zero still renders as `$0.00`.
+
+A service may post `null` to mean "no figure yet"; that renders as `-`. Posting `0` means a
+real zero. The distinction matters for any provider whose billing reports on a delay.
+
+Both scrape the rendered page — neither console exposes a JSON endpoint a content script
+can call directly. Each posts only its own key, and the server merges the `cost` object
+per service, so one provider updating never wipes another's figure. Those tabs need to
+stay open; the Claude one is reloaded every 30 minutes since spend moves slowly.
 
 The extension and the local server are optional: without them the menu bar still works
 from the OAuth API alone, just at ~5-minute resolution and with no API Cost rows.
@@ -115,15 +133,18 @@ Skip only if ~5-minute usage updates are fine and you don't want the API Cost ro
 3. Click **Load unpacked** and select the `extension/` folder.
 4. Keep **any** claude.ai tab open — `usage.js` pushes plan usage from there every 60s.
    It does not have to be the usage settings page; any claude.ai page works.
-5. For the API Cost rows, also open
-   <https://platform.claude.com/workspaces/default/cost> and leave that tab open.
+5. For the API Cost rows, leave open whichever provider pages you want rows for:
+   - <https://platform.claude.com/workspaces/default/cost> → `Claude:`
+   - `https://platform.openai.com/settings/<project>/limits` → `OpenAI:`
+   - `https://aistudio.google.com/spend?project=<project>` → `Gemini:`
 
 `usage.js` calls claude.ai's own `/api/organizations/<org>/usage` and POSTs the JSON
 verbatim. With several claude.ai tabs open, a `localStorage` lease elects a single poller
 so it stays at one request per minute in total, not one per tab.
 
-`cost.js` scrapes month-to-date spend from the console page and POSTs it as `cost.claude`.
-A LaunchAgent reloads that tab every 30 minutes (see INSTALL.md).
+`cost.js` posts `cost.claude`, `openai.js` posts `cost.openai`, `gemini.js` posts
+`cost.gemini` — each only its own key. A LaunchAgent reloads the Claude console tab every
+30 minutes (see INSTALL.md); the OpenAI and AI Studio pages update themselves.
 
 Verify:
 
@@ -214,8 +235,10 @@ curl -X POST localhost:7823/usage -H 'Content-Type: application/json' \
   -d '{"cost":{"gemini":37.50},"updatedAt":'"$(date +%s)"'000}'
 ```
 
-That renders `Gemini: $37.50` beneath `Claude:`. The server shallow-merges top-level keys,
-so each writer must POST the whole `cost` object it owns.
+That renders a new row alongside `Claude:`, `OpenAI:` and `Gemini:`. The server merges `cost`
+one level deep, so each writer posts only its own key and leaves the others intact.
+Names get title-case automatically; add an entry to the `case` in the renderer for one
+with internal capitals (that is how `openai` becomes `OpenAI`).
 
 ### What "Last Updated" refers to
 
@@ -239,7 +262,9 @@ claude-usage-menubar/
 ├── extension/                          # 60s usage pushes + API Cost rows
 │   ├── manifest.json
 │   ├── usage.js                        # pushes plan usage from any claude.ai tab
-│   └── cost.js                         # scrapes platform.claude.com spend
+│   ├── cost.js                         # scrapes platform.claude.com spend
+│   ├── openai.js                       # scrapes platform.openai.com project spend
+│   └── gemini.js                       # scrapes AI Studio monthly spend
 ├── server/
 │   ├── server.js
 │   ├── io.claude-usage.server.plist    # template — see install steps

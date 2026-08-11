@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Claude Usage Reporter",
-  "version": "3.0.0",
-  "description": "Pushes Claude plan usage and month-to-date API spend to a local menu bar server.",
+  "version": "3.2.0",
+  "description": "Pushes Claude plan usage and per-service API spend (Claude, OpenAI, Gemini) to a local menu bar server.",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -20,6 +20,8 @@
   "host_permissions": [
     "https://claude.ai/*",
     "https://platform.claude.com/workspaces/*/cost*",
+    "https://platform.openai.com/settings/*/limits*",
+    "https://aistudio.google.com/*",
     "http://localhost:7823/*"
   ],
   "content_scripts": [
@@ -31,6 +33,19 @@
     {
       "matches": ["https://platform.claude.com/workspaces/*/cost*"],
       "js": ["cost.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://platform.openai.com/settings/*/limits*"],
+      "js": ["openai.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://aistudio.google.com/spend*",
+        "https://aistudio.google.com/*/spend*"
+      ],
+      "js": ["gemini.js"],
       "run_at": "document_idle"
     }
   ]

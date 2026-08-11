@@ -7,11 +7,13 @@
 Surfaces Claude session and weekly usage limits (and optional Anthropic API costs) in the macOS menu bar via [SwiftBar](https://github.com/swiftbar/SwiftBar).
 
 ```
-extension (any claude.ai tab) ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
-  usage.js  → plan usage, every 60s      (Node.js, ~50 LOC)     (bash plugin)
-  cost.js   → API spend                                              │
-                                                                     │
-Claude OAuth usage API ─────────────GET (fallback, ≤1 per 5 min)─────┘
+extension content scripts ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
+  usage.js   → plan usage, any claude.ai tab, 60s                 (bash plugin)
+  cost.js    → Claude console spend                                    │
+  openai.js  → OpenAI project spend                                    │
+  gemini.js  → Gemini monthly spend                                    │
+                                                                       │
+Claude OAuth usage API ───────────GET (fallback, ≤1 per 5 min)─────────┘
 ```
 
 **Usage** has two sources. `usage.js` runs in any open claude.ai tab and calls claude.ai's
@@ -20,8 +22,12 @@ updates. The OAuth API (`api.anthropic.com`, Claude Code's keychain token) is th
 when no tab is open; it is rate-limited to roughly one call every three minutes across all
 consumers, so it cannot drive a 60s cadence on its own. Both return the same payload shape.
 
-**API cost** is the one figure that endpoint doesn't expose, so it still comes from a
-content script scraping the Claude console into a small local Node server.
+**API cost** is one row per service, scraped by a content script per provider:
+`cost.js` from the Claude console, `openai.js` from the OpenAI project Limits page,
+`gemini.js` from the Google AI Studio Spend page (which Google updates up to 24h late). Each
+posts only its own key and the server merges `cost` per service, so providers never
+overwrite each other. Neither console exposes a JSON endpoint a content script can call,
+so both are DOM scrapes and need their tab left open.
 
 That split matters for install: **the extension, the Node server, and both LaunchAgents
 are needed for per-minute usage updates and the API Cost rows.** Without them the menu
@@ -44,7 +50,7 @@ The user must already have, or be willing to install:
 For per-minute usage updates and the optional API Cost rows:
 
 - **Node.js** (any modern version — only the standard library is used). Check with `which node`. If missing, suggest `brew install node` and **wait for confirmation** before running it.
-- **A Chromium-based browser** (Chrome, Dia, Arc, Brave) where the user is logged into claude.ai (for usage) and the Claude console (for cost).
+- **A Chromium-based browser** (Chrome, Dia, Arc, Brave) where the user is logged into claude.ai (usage), and the Claude / OpenAI / Google AI Studio consoles (cost rows).
 
 Verify the keychain token is readable:
 
@@ -199,6 +205,8 @@ claude-usage-menubar/
 ├── extension/
 │   ├── manifest.json
 │   ├── usage.js                          # pushes plan usage from any claude.ai tab
+│   ├── openai.js                         # scrapes OpenAI project spend
+│   ├── gemini.js                         # scrapes AI Studio monthly spend
 │   ├── cost.js                           # scrapes console month-to-date spend
 │   ├── cost.js                           # scrapes platform.claude.com cost page
 │   └── icons/
