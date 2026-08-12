@@ -53,6 +53,15 @@ http
           // wipe every other service's figure.
           if (incoming.cost && typeof incoming.cost === "object") {
             next.cost = { ...(prev.cost || {}), ...incoming.cost };
+            // Stamp arrival time PER SERVICE. The top-level `updatedAt` is global
+            // and whichever scraper posted last wins it, so it cannot say which
+            // provider stopped reporting -- and every scraper posts nothing at all
+            // when its scrape fails (wrong page, markup moved, tab closed), so a
+            // per-service stamp that stops advancing is exactly the breakage signal
+            // the menu needs to flag that one row.
+            next.costUpdatedAt = { ...(prev.costUpdatedAt || {}) };
+            const at = Date.now();
+            for (const k of Object.keys(incoming.cost)) next.costUpdatedAt[k] = at;
           }
           state = next;
           fs.writeFile(STATE_FILE, JSON.stringify(state), () => {});

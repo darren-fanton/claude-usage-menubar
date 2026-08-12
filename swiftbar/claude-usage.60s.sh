@@ -203,7 +203,7 @@ fi
 # The two payloads are fed on one stdin separated by a 0x1F record separator.
 read_fields() {
   printf '%s\n\037\n%s' "$USAGE_JSON" "$COST_JSON" | python3 -c "
-import json, sys
+import json, sys, time
 from datetime import datetime
 
 raw = sys.stdin.read().split('\n\037\n')
@@ -249,13 +249,39 @@ def scoped_pct(name):
     # Fall back to the top-level seven_day_<model> window when present.
     return pct(win('seven_day_' + name))
 
-def cget(*ks):
-    cur = c
-    for k in ks:
-        cur = cur.get(k) if isinstance(cur, dict) else None
-        if cur is None:
-            return ''
-    return cur
+def is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+# Cost is keyed by SERVICE (claude, gemini, ...), one row each -- never by model.
+# A null value is meaningful, not missing: the provider page rendered but has no
+# figure yet (Gemini shows a dash until Google's billing pipeline reports, up to
+# 24h later). Keep it so the row still shows, as a dash -- printing 0 would claim
+# zero spend rather than not-known-yet.
+# 'totalUSD'/'perModel' are the pre-per-service payload shape; ignore them rather
+# than render a stray 'TotalUSD:' row from a not-yet-reloaded script.
+costs = dict(
+    (k, v) for k, v in (c.get('cost') or {}).items()
+    if k not in ('period', 'totalUSD', 'perModel') and (v is None or is_num(v))
+)
+
+# Age in seconds since each service last POSTed, from the per-service arrival
+# stamps the server writes. The global updatedAt stands in ONLY while no stamps
+# exist at all -- state written before the server recorded them -- so a first run
+# after the upgrade doesn't flag every row until each scraper has posted once.
+# Once any stamp exists the fallback is dropped: it is clobbered by whichever
+# scraper posted last, so a service missing from the map would otherwise hide
+# behind its neighbours' liveness, which is exactly the case worth flagging.
+stamps = c.get('costUpdatedAt') or {}
+fallback = None if stamps else c.get('updatedAt')
+now_ms = time.time() * 1000
+
+def age_of(k):
+    ts = stamps.get(k)
+    if not is_num(ts):
+        ts = fallback
+    if not is_num(ts):
+        return ''
+    return str(max(0, int((now_ms - ts) / 1000)))
 
 five, seven = win('five_hour'), win('seven_day')
 rows = [
@@ -265,24 +291,12 @@ rows = [
     scoped_pct('opus'),
     scoped_pct('design'),
     scoped_pct('fable'),
-    # Cost is keyed by SERVICE (claude, gemini, ...), one row each -- never by
-    # model. Emit every numeric key as name=value joined by ';' so adding a new
-    # provider needs no change here or in the renderer. Sorted for stable order.
-    # A null value is meaningful, not missing: the provider page rendered but has no
-    # figure yet (Gemini shows a dash until Google's billing pipeline reports, up to
-    # 24h later). Emit an empty value so the row still shows, as a dash -- printing 0
-    # would claim zero spend rather than not-known-yet.
+    # Values and ages as name=value pairs joined by ';', over the same sorted key
+    # set, so adding a new provider needs no change here or in the renderer.
     # NB: no double quotes anywhere in this python block; it is embedded in a bash
     # double-quoted string and a quote here silently truncates the whole parser.
-    ';'.join(
-        '%s=%s' % (k, '' if v is None else v)
-        for k, v in sorted((c.get('cost') or {}).items())
-        # 'totalUSD'/'perModel' are the pre-per-service payload shape; ignore them
-        # rather than render a stray 'TotalUSD:' row from a not-yet-reloaded script.
-        if k not in ('period', 'totalUSD', 'perModel')
-        and (v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)))
-    ),
-    cget('updatedAt'),
+    ';'.join('%s=%s' % (k, '' if costs[k] is None else costs[k]) for k in sorted(costs)),
+    ';'.join('%s=%s' % (k, age_of(k)) for k in sorted(costs)),
 ]
 for r in rows:
     print('' if r is None else r)
@@ -299,8 +313,45 @@ for r in rows:
   IFS= read -r WEEKLY_DESIGN_PCT
   IFS= read -r WEEKLY_FABLE_PCT
   IFS= read -r COST_SERVICES
-  IFS= read -r COST_UPDATED_AT
+  IFS= read -r COST_AGES
 } < <(read_fields)
+
+# How old a service's last reported figure may get before its row is flagged as
+# not updating. Each scraper POSTs every 60s while its tab is open and posts
+# NOTHING when the scrape fails, so anything past a few minutes means that one
+# provider's pipeline is down (tab closed, logged out, markup moved) even while
+# the others keep reporting. 15 min tolerates the 30-min page reload cycle's
+# in-flight gaps without sitting on a genuine break for long.
+COST_STALE_MAX=900
+
+# Human age from a seconds count: "just now" / "5 min ago" / "3h ago" / "2d ago".
+fmt_age() {
+  local s="$1" m h d
+  case "$s" in ''|*[!0-9]*) echo "unknown"; return;; esac
+  m=$(( s / 60 ))
+  [ "$m" -lt 1 ] && { echo "just now"; return; }
+  [ "$m" -eq 1 ] && { echo "1 min ago"; return; }
+  [ "$m" -lt 90 ] && { echo "$m min ago"; return; }
+  h=$(( m / 60 ))
+  [ "$h" -lt 48 ] && { echo "${h}h ago"; return; }
+  d=$(( h / 24 ))
+  echo "${d}d ago"
+}
+
+# Look up one service's age (seconds) in the "claude=45;gemini=3600" pair string.
+# Echoes nothing when that service has no recorded update at all.
+cost_age() {
+  local key="$1" pair _ifs="$IFS"
+  IFS=';'
+  for pair in $COST_AGES; do
+    if [ "${pair%%=*}" = "$key" ]; then
+      IFS="$_ifs"
+      printf '%s' "${pair#*=}"
+      return
+    fi
+  done
+  IFS="$_ifs"
+}
 
 # Format a number as $XX.XX (or "-" if empty).
 fmt_usd() {
@@ -338,9 +389,39 @@ if [ -n "$RESET_EPOCH" ]; then
     PIE_PCT=$(( (SESSION_TOTAL_MIN - REMAINING) * 100 / SESSION_TOTAL_MIN ))
     [ "$PIE_PCT" -lt 0 ]   && PIE_PCT=0
     [ "$PIE_PCT" -gt 100 ] && PIE_PCT=100
+    SESSION_RESET_AT=$(date -r "$RESET_EPOCH" +"%-I:%M %p" 2>/dev/null)
+  else
+    # The reset time has passed: the 5-hour window rolled over, so usage is back
+    # to 0 for the window we are now in. Report a fresh 0% and an empty ring
+    # rather than freezing on the previous window's percentage. The old reset
+    # time is dropped rather than shown in the past -- the next one isn't known
+    # until the API reports again, so the reset row simply won't render. Same
+    # rule the Codex block applies to its own rolled-over session window.
+    SESSION_PCT="0"
+    RESET_EPOCH=""
   fi
-  SESSION_RESET_AT=$(date -r "$RESET_EPOCH" +"%-I:%M %p" 2>/dev/null)
 fi
+
+# --- Weekly cap override for the menu bar ---
+# The 7-day all-models bucket is the hard stop: at 100% nothing runs until it
+# resets, whatever the 5-hour number says. So the menu bar reports the cap --
+# full pie, 100% -- rather than a comfortable session percentage beside a
+# part-filled ring, which would read as "plenty left" while everything is
+# blocked. This deliberately outranks the session rollover above; a fresh 5h
+# window is worth nothing while the week is capped.
+#
+# Only the menu bar is overridden. The dropdown keeps showing the true session
+# and per-model numbers, which is where you look to find out WHAT is exhausted.
+TITLE_PCT="$SESSION_PCT"
+case "$WEEKLY_ALL_PCT" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$WEEKLY_ALL_PCT" -ge 100 ]; then
+      TITLE_PCT="100"
+      PIE_PCT=100
+    fi
+    ;;
+esac
 
 # --- Codex usage (read from the local Codex CLI session logs) ---
 # The OpenAI Codex CLI appends `rate_limits` events to its session rollout files
@@ -361,6 +442,7 @@ CODEX_RESET_EPOCH=""
 CODEX_CAPPED=0
 CODEX_WEEKLY_PCT=""
 CODEX_WEEKLY_RESET_EPOCH=""
+CODEX_WARN=""
 CODEX_SESSIONS="$HOME/.codex/sessions"
 if [ -d "$CODEX_SESSIONS" ]; then
   # Newest-first list of recent rollout files (capped for speed).
@@ -470,6 +552,21 @@ EOF
     CODEX_RESET_AT=""
     CODEX_RESET_EPOCH=""
   fi
+
+  # Warning conditions for the Codex header. This section is fed by local rollout
+  # logs, so "broken" means the logs are present but yield nothing usable -- the
+  # schema moved (this parser has been bitten by that before) -- or the newest
+  # reading belongs to a weekly window that has already closed, i.e. every number
+  # under the header is from an expired window. NOT having run Codex lately is not
+  # a warning: the 5h rollover above already renders that as a fresh 0%.
+  if [ -z "$CODEX_FILES" ]; then
+    CODEX_WARN="No Codex session logs in ~/.codex/sessions"
+  elif [ -z "$CODEX_PCT_RAW" ] && [ -z "$CODEX_WEEKLY_PCT_RAW" ]; then
+    CODEX_WARN="Session logs carry no rate-limit data — the Codex log format may have changed"
+  elif [ -n "$CODEX_WEEKLY_RESET_EPOCH" ] && [ "$CODEX_WEEKLY_RESET_EPOCH" != "null" ] \
+       && [ "$CODEX_WEEKLY_RESET_EPOCH" -le "$NOW_EPOCH" ] 2>/dev/null; then
+    CODEX_WARN="Weekly window already reset — no new reading since Codex last ran"
+  fi
 fi
 
 # Render the pie chart from SVG (vector) and downsample to 11x11 with
@@ -503,18 +600,6 @@ generate_pie_b64() {
       <path d="M 50,20 A 30,30 0 '$large',1 '$bx','$by' L 50,50 Z" fill="black"/>
     </svg>'
   fi
-  svg_to_b64 "$svg" 16.5 16.5 | tee "$_f"
-}
-
-# Dash icon shown when the session has reset since the last data scrape,
-# signalling that the displayed numbers are stale and the user should click
-# to refresh.
-generate_dash_b64() {
-  local _f="$IMGCACHE/dash"
-  [ -f "$_f" ] && { cat "$_f"; return; }
-  local svg='<svg xmlns="http://www.w3.org/2000/svg" width="16.5pt" height="16.5pt" viewBox="0 0 100 100">
-    <rect x="20" y="45" width="60" height="10" rx="3" fill="black"/>
-  </svg>'
   svg_to_b64 "$svg" 16.5 16.5 | tee "$_f"
 }
 
@@ -629,32 +714,20 @@ generate_reset_b64() {
   fi
 }
 
-# Has the session reset time passed since we last scraped? If so, the cached
-# numbers no longer reflect reality and we surface a dash to prompt a refresh.
-SESSION_EXPIRED=0
-if [ -n "$RESET_EPOCH" ]; then
-  NOW_EPOCH=$(date +%s)
-  [ "$NOW_EPOCH" -gt "$RESET_EPOCH" ] && SESSION_EXPIRED=1
-fi
-
-# Choose icon: dash if stale, pie chart based on session time, or empty ring
-# if we have no session data (e.g. before the extension has reported anything).
+# Choose icon: pie chart of session time elapsed, or an empty ring when there is
+# no open window to measure -- either no session data at all (before anything has
+# reported) or a window that has rolled over, which zeroed PIE_PCT above.
 ICON_B64=""
-if [ "$SESSION_EXPIRED" = "1" ]; then
-  ICON_B64="$(generate_dash_b64)"
-elif [ -n "$PIE_PCT" ]; then
+if [ -n "$PIE_PCT" ]; then
   ICON_B64="$(generate_pie_b64 "$PIE_PCT")"
 else
-  # No session data yet -> render an empty 0% ring as a placeholder.
   ICON_B64="$(generate_pie_b64 0)"
 fi
 
 # --- Menu bar title ---
 TITLE_TEXT="--"
-if [ "$SESSION_EXPIRED" = "1" ]; then
-  TITLE_TEXT="–"
-elif [ -n "$SESSION_PCT" ]; then
-  TITLE_TEXT="${SESSION_PCT}%"
+if [ -n "$TITLE_PCT" ]; then
+  TITLE_TEXT="${TITLE_PCT}%"
 fi
 
 if [ -n "$ICON_B64" ]; then
@@ -682,13 +755,20 @@ G="color=#888888,#888888"
 render_codex() {
   [ -n "$CODEX_PCT" ] || [ -n "$CODEX_RESET_AT" ] || [ "$CODEX_CAPPED" = "1" ] \
     || [ -n "$CODEX_WEEKLY_PCT" ] || [ -n "$CODEX_WEEKLY_RESET_EPOCH" ] \
+    || [ -n "$CODEX_WARN" ] \
     || return
   # A blank row of vertical spacing above the Codex section. SwiftBar collapses
   # truly empty lines, so emit a non-breaking space (U+00A0) to force a full-height
   # row that renders as blank.
   printf '\xc2\xa0\n'
   # Green pill title (rendered as a full-color image; see the Claude header note).
-  echo " | image=$(generate_label_b64 "Codex" "#16a34a")"
+  # A warning to the RIGHT of the pill means the rows below it are not being fed:
+  # the pill is an image, so the row's text label lands after it. Hover for why.
+  if [ -n "$CODEX_WARN" ]; then
+    echo "⚠️ | image=$(generate_label_b64 "Codex" "#16a34a") tooltip=\"$CODEX_WARN\""
+  else
+    echo " | image=$(generate_label_b64 "Codex" "#16a34a")"
+  fi
   # Capped: the limit is exhausted and Codex stops reporting a 5h window, so show
   # the cap state rather than a stale percentage.
   if [ "$CODEX_CAPPED" = "1" ]; then
@@ -727,8 +807,44 @@ render_codex_weekly() {
   fi
 }
 
+# --- Claude header ---
+# Blue pill title (rendered as a full-color image; SwiftBar can't color a row bg),
+# with a warning to the RIGHT of the pill when the payload behind EVERY Claude row
+# -- session, weekly, per-model -- is not current. The pill is an image, so the
+# row's text label lands after it. Rendered by both the no-data path and the normal
+# one so the section is always identifiable, even when it has nothing to show.
+CLAUDE_WARN=""
+if [ -z "$USAGE_JSON" ]; then
+  CLAUDE_WARN="No usage data — see the error below"
+elif [ "$USAGE_AGE" -ge "$USAGE_TTL" ]; then
+  # Past the TTL means a fetch was attempted and failed, so these are cached
+  # numbers being replayed rather than anything current.
+  CLAUDE_WARN="Not updating — showing a cached snapshot from $(fmt_age "$USAGE_AGE")"
+elif [ -z "$PUSHED_USAGE" ]; then
+  # Nothing was pushed within USAGE_PUSH_MAX, so the extension's once-a-minute
+  # poll is not landing and these numbers came from the plugin's own 5-minute
+  # OAuth fallback. The data is not WRONG, just up to five minutes behind, which
+  # is invisible without saying so.
+  #
+  # Keyed on the SOURCE, not on age: the fallback resets the age to 0 every time
+  # it fetches, so an age test would blink the warning off every 5 minutes while
+  # minute polling stayed just as broken.
+  CLAUDE_WARN="Minute polling is down — updating every 5 min via the API fallback instead of every 60s"
+fi
+render_claude_header() {
+  local img
+  img=$(generate_label_b64 "Claude" "#3b82f6")
+  local href='href="https://claude.ai/new#settings/usage"'
+  if [ -n "$CLAUDE_WARN" ]; then
+    echo "⚠️ | image=$img $href tooltip=\"$CLAUDE_WARN\""
+  else
+    echo " | image=$img $href"
+  fi
+}
+
 if [ -z "$USAGE_JSON" ]; then
   # Only reached when the fetch failed AND there was no usable cached payload.
+  render_claude_header
   if [ -z "$TOKEN" ]; then
     echo "No Claude Code credentials in keychain | color=red"
   elif [ "$HTTP_CODE" = "429" ]; then
@@ -746,8 +862,7 @@ fi
 # Grey header line (no action), then white data rows. The reset time is always the
 # absolute one computed from the API timestamp; there is no scraped-text fallback.
 SESSION_HEADER_RESET="$SESSION_RESET_AT"
-# Blue pill title (rendered as a full-color image; SwiftBar can't color a row bg).
-echo " | image=$(generate_label_b64 "Claude" "#3b82f6") href=\"https://claude.ai/new#settings/usage\""
+render_claude_header
 if [ -n "$SESSION_PCT" ]; then
   echo "${SESSION_PCT}% | image=$(generate_bar_b64 "$SESSION_PCT" "#3b82f6") size=12 $C"
 fi
@@ -811,48 +926,55 @@ if [ -n "$COST_SERVICES" ]; then
       openai) _label="OpenAI" ;;
       *)      _label="$(printf '%s' "${_name:0:1}" | tr '[:lower:]' '[:upper:]')${_name:1}" ;;
     esac
+    # A warning to the LEFT of the label when THIS provider's scraper has stopped
+    # reporting. Each service is scraped independently, so one going dark (tab
+    # closed, logged out, page markup moved) leaves a stale figure sitting next to
+    # two live ones with nothing to distinguish them. The age is per service --
+    # a single global timestamp could not tell them apart.
+    _age=$(cost_age "$_name")
+    _warn=""
+    if [ -z "$_age" ]; then
+      _warn="Never updated — nothing has been received for $_label"
+    elif [ "$_age" -ge "$COST_STALE_MAX" ] 2>/dev/null; then
+      _warn="Not updating — last figure received $(fmt_age "$_age")"
+    fi
     # Google reports Gemini spend on a delay of up to 24h, so this row can read
     # $0.00 while spend is actually accruing. Say so on hover rather than letting
     # the number quietly mislead. A tooltip adds no action, so the row stays inert.
-    _tip=""
+    _note=""
     [ "$_name" = "gemini" ] && \
-      _tip=' tooltip="Google reports Gemini spend with up to 24h delay"'
+      _note="Google reports Gemini spend with up to 24h delay"
+    _tip=""
+    if [ -n "$_warn" ] && [ -n "$_note" ]; then
+      _tip=" tooltip=\"$_warn. $_note\""
+    elif [ -n "$_warn" ]; then
+      _tip=" tooltip=\"$_warn\""
+    elif [ -n "$_note" ]; then
+      _tip=" tooltip=\"$_note\""
+    fi
+    [ -n "$_warn" ] && _label="⚠️ $_label"
     echo "${_label}: $(fmt_usd "$_val") | $CC$_tip"
   done
   IFS="$_old_ifs"
 fi
 
-# Footer reports the age of whatever displayed data can actually be stale.
+# Footer reports the age of the CLAUDE USAGE payload, always and only. That is the
+# headline number -- the one the menu bar itself shows -- so a single unqualified
+# "Last Updated" has to mean that or nothing.
 #
-# Priority: a cached usage payload wins, because the session percentage is the
-# headline number and the one the menu bar itself shows -- if that is being served
-# from cache after a failed fetch, say so. Otherwise report the scraped cost age.
-# When usage is live and there is no cost data, nothing can be stale, so the footer
-# and its separator are omitted entirely.
-#
-# Gate the cost branch on the cost VALUES, not just on updatedAt: any content script
-# POSTing to the local server sets updatedAt, so keying off it alone made the footer
-# date a row that wasn't being rendered.
-fmt_age_min() {
-  case "$1" in
-    0) echo "just now" ;;
-    1) echo "1 min ago" ;;
-    *) echo "$1 min ago" ;;
-  esac
-}
+# It used to fall through to the cost scrape age whenever usage happened to be
+# fetched live on this render, so the same label silently described two different
+# sources with no way to tell which. Cost freshness is now carried per service by
+# the warning on each API Cost row, which is strictly better: one number could
+# never say WHICH provider had gone quiet.
 FOOTER=""
 if [ "$USAGE_AGE" -ge "$USAGE_TTL" ]; then
   # Older than the refresh interval => a fetch was attempted and failed. Mark it,
   # so a degraded menu is visibly different from one inside its normal TTL.
-  FOOTER="Last Updated: $(fmt_age_min $(( USAGE_AGE / 60 ))) (cached)"
-elif [ "$USAGE_AGE" -gt 0 ]; then
-  # Normal in-TTL reuse: the usage numbers are up to USAGE_TTL old, not live.
-  FOOTER="Last Updated: $(fmt_age_min $(( USAGE_AGE / 60 )))"
-elif [ -n "$COST_UPDATED_AT" ] && [ -n "$COST_SERVICES" ]; then
-  NOW_MS=$(($(date +%s) * 1000))
-  DELTA_MIN=$(( (NOW_MS - COST_UPDATED_AT) / 60000 ))
-  [ "$DELTA_MIN" -lt 0 ] && DELTA_MIN=0
-  FOOTER="Last Updated: $(fmt_age_min "$DELTA_MIN")"
+  FOOTER="Last Updated: $(fmt_age "$USAGE_AGE") (cached)"
+else
+  # Either fetched live on this render (age 0) or normal in-TTL reuse.
+  FOOTER="Last Updated: $(fmt_age "$USAGE_AGE")"
 fi
 if [ -n "$FOOTER" ]; then
   echo "---"
