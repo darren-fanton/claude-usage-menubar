@@ -88,7 +88,14 @@
       await fetch(ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ usage, usageUpdatedAt: Date.now() }),
+        // See background.js for usageSource: the worker alarm is the poller that
+        // is meant to keep this current; this page timer only contributes while
+        // its tab happens to be awake.
+        body: JSON.stringify({
+          usage,
+          usageUpdatedAt: Date.now(),
+          usageSource: "page",
+        }),
       });
     } catch (e) {
       // local server down or offline; try again next tick
