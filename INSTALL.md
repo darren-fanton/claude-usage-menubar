@@ -29,14 +29,14 @@ posts only its own key and the server merges `cost` per service, so providers ne
 overwrite each other. Neither console exposes a JSON endpoint a content script can call,
 so both are DOM scrapes and need their tab left open.
 
-That split matters for install: **the extension, the Node server, and both LaunchAgents
-are needed for per-minute usage updates and the API Cost rows.** Without them the menu
-still works from the OAuth API alone at ~5-minute resolution; in that case only step 3
-(the SwiftBar plugin) is required — skip steps 1, 2, and the refresh agent entirely. Ask
-the user which they want before installing anything.
+That split matters for install: **the extension and the Node server are needed for
+per-minute usage updates and the API Cost rows.** Without them the menu still works from
+the OAuth API alone at ~5-minute resolution; in that case only step 3 (the SwiftBar
+plugin) is required — skip steps 1 and 2 entirely. Ask the user which they want before
+installing anything.
 
-The two LaunchAgents: one keeps the Node server alive, one reloads the console cost tab
-every 30 minutes.
+There is one LaunchAgent, and it only keeps the Node server alive. Keeping the scraped
+provider tabs reloaded is the extension's own job, on a service-worker alarm.
 
 ## Prerequisites — confirm with the user before installing anything
 
@@ -109,42 +109,23 @@ Server logs land at `~/Library/Logs/claude-usage-server.log`.
 
 **Uninstall (for reference):** `launchctl unload ~/Library/LaunchAgents/io.claude-usage.server.plist && rm ~/Library/LaunchAgents/io.claude-usage.server.plist`.
 
-## Step 2 — Install the auto-refresh helper + LaunchAgent
-
-This is the AppleScript-driven helper that reloads the user's open `platform.claude.com/workspaces/default/cost` tab every 30 minutes, so the cost scrape stays fresh. It only touches that one URL prefix — every other tab is left alone. Skip this agent entirely if the user isn't installing the API Cost rows.
-
-Note that each run walks every tab of every window across four browsers, one Apple Event per tab. With many tabs open that is slow: measured 7.8s for 60 tabs in Dia and 3.0s in Chrome, ~11s total per run. It blocks the browsers' main threads, not the whole system, so it does not stall the menu bar — but it is the first thing to look at if the browser itself feels sticky.
-
-```bash
-mkdir -p "$HOME/.local/bin"
-cp "$PROJECT_DIR/swiftbar/refresh-usage.sh" "$HOME/.local/bin/claude-usage-refresh"
-chmod +x "$HOME/.local/bin/claude-usage-refresh"
-
-# Materialize the refresh LaunchAgent
-sed -e "s|__HOME__|$HOME|g" \
-    "$PROJECT_DIR/server/io.claude-usage.refresh.plist" \
-  > ~/Library/LaunchAgents/io.claude-usage.refresh.plist
-
-launchctl unload ~/Library/LaunchAgents/io.claude-usage.refresh.plist 2>/dev/null
-launchctl load   ~/Library/LaunchAgents/io.claude-usage.refresh.plist
-```
-
-> **Heads up to flag for the user**: the first time the refresh helper runs, macOS will prompt to grant the controlling app (e.g. `osascript`, or whatever spawned launchd) **Automation** permission for Chrome / Dia / Arc / Brave. The prompt may appear silently in **System Settings → Privacy & Security → Automation**. If the menu bar never updates, this is the most likely cause — have the user check that panel and approve.
-
-Refresh logs land at `~/Library/Logs/claude-usage-refresh.log`. To stop auto-reloads (e.g. it's interrupting an open chat): `launchctl unload ~/Library/LaunchAgents/io.claude-usage.refresh.plist`.
-
-## Step 3 — Install the Chrome extension
+## Step 2 — Install the Chrome extension
 
 This is a manual step — you can't load an unpacked extension on the user's behalf. Walk them through it:
 
 1. Open `chrome://extensions` (or the equivalent in Dia/Arc/Brave).
 2. Toggle **Developer mode** in the top right.
 3. Click **Load unpacked** and select the `extension/` folder inside this project.
-4. Open <https://platform.claude.com/workspaces/default/cost> and leave the tab open. `cost.js` scrapes the month-to-date total from it and POSTs it as `cost.claude` to `localhost:7823`.
+4. Open one tab per provider they want a cost row for, and leave each open:
+   - <https://platform.claude.com/workspaces/default/cost> → `cost.claude`
+   - `https://platform.openai.com/settings/<project>/limits` → `cost.openai`
+   - <https://aistudio.google.com/spend> → `cost.gemini`
 
 Costs are tracked **per service, one row each** — never broken down by model. Any writer can add a provider by POSTing its own key (`cost.gemini`, …); the menu renders a row per numeric key it finds and needs no change.
 
-Note for reloads: Chromium only injects content scripts when a page loads, so a newly added script does not reach tabs that are already open. `background.js` handles that — on install, update (which is what an unpacked reload fires) and browser startup it injects each content script into every open tab its patterns match, so reloading the extension is sufficient. The reverse still needs manual work: a script *removed* from the extension keeps running in open tabs until those tabs reload.
+Those tabs have to be reloaded periodically or they go quiet: none of the three pages repaints its figure after load, and Chromium freezes background tabs — a frozen tab runs no scrape timer, so on a backgrounded browser each tab posts once about 2s after load and then nothing until the next reload. `background.js` reloads every scraped tab except `claude.ai` on a 10-minute alarm, which is therefore the real reporting cadence, not a safety net behind the 60s page timers. **No LaunchAgent, AppleScript, or Automation permission is involved** — earlier versions drove this from launchd and only ever reloaded the Claude tab.
+
+Note for reloads *of the extension itself*: Chromium only injects content scripts when a page loads, so a newly added script does not reach tabs that are already open. `background.js` handles that — on install, update (which is what an unpacked reload fires) and browser startup it injects each content script into every open tab its patterns match, so reloading the extension is sufficient. The reverse still needs manual work: a script *removed* from the extension keeps running in open tabs until those tabs reload.
 
 There is no longer a claude.ai tab to open — usage comes from the API.
 
@@ -157,7 +138,7 @@ curl -s http://localhost:7823/usage | jq
 Should show a `cost` object within a few seconds. Usage percentages will **not** appear
 here; that's expected.
 
-## Step 4 — Install the SwiftBar plugin
+## Step 3 — Install the SwiftBar plugin
 
 ```bash
 PLUGIN_DIR="$HOME/Library/Application Support/SwiftBar/Plugins"   # default
@@ -213,11 +194,9 @@ claude-usage-menubar/
 │   └── icons/
 ├── server/
 │   ├── server.js                         # the Node server itself
-│   ├── io.claude-usage.server.plist      # template — see Step 1
-│   └── io.claude-usage.refresh.plist     # template — see Step 2
+│   └── io.claude-usage.server.plist      # template — see Step 1
 └── swiftbar/
     ├── claude-usage.60s.sh               # the menu bar plugin
-    ├── refresh-usage.sh                  # auto-reload helper (→ ~/.local/bin/)
     ├── icon.svg
     ├── claude-logo-source.png
     ├── menubar-icon.png
@@ -236,10 +215,7 @@ launchctl list | grep claude-usage
 # 3. Server log has the banner
 tail -5 ~/Library/Logs/claude-usage-server.log
 
-# 4. Refresh log shows recent activity (after ~1 min)
-tail -10 ~/Library/Logs/claude-usage-refresh.log
-
-# 5. SwiftBar plugin renders without errors
+# 4. SwiftBar plugin renders without errors
 bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.60s.sh" | head -20
 ```
 
@@ -250,5 +226,5 @@ bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.60s.sh" | 
 - **`curl` returns `{}` indefinitely** — extension can't reach localhost. Check Chrome DevTools → Console on `claude.ai` for `Failed to fetch` errors against `localhost:7823`. Verify the manifest still has `http://localhost:7823/*` in `host_permissions` and reload the extension.
 - **Menu bar values flip between two readings** — the user has tabs in two different Claude accounts open, both POSTing. The content script is supposed to skip POSTing when the session bar has no reset countdown, but if both have valid data, the user must close one of the duplicates. Look for incoming POSTs by tailing the server log and watch `state.json` for ~30s to identify the rogue tab.
 - **Reset times are wrong / missing** — these now come from the API's absolute `resets_at` timestamps, so a wrong time means either a system clock problem or an API shape change. Inspect the raw payload with the `curl` in README §2.
-- **Auto-refresh isn't reloading the cost tab** — check `~/Library/Logs/claude-usage-refresh.log`. The most common cause is missing **Automation** permission for the browser app under System Settings → Privacy & Security → Automation. Also make sure a tab is open at exactly `platform.claude.com/workspaces/default/cost` — the helper only matches that full prefix.
+- **A cost row shows ⚠️ and its figure is frozen** — that provider's scraper has stopped posting, which almost always means its tab is gone, logged out, or routed off the scraped path. Confirm a tab is open at a URL matching that provider's `content_scripts` pattern in `manifest.json`, then check the extension's service worker console for `[claude-usage] reload failed`. The worker reloads those tabs every 10 minutes; the row is flagged after 15.
 - **Server LaunchAgent won't start** — check `~/Library/Logs/claude-usage-server.log`. The `node` path baked into the plist may be wrong; rerun the `sed` step from §1 with the correct `which node` output.

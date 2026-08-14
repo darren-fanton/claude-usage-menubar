@@ -9,8 +9,17 @@
 //
 // This runs on install, on update (which is what an unpacked reload fires), and
 // at browser startup, and injects each content script into every open tab its own
-// manifest patterns match. After this, reloading the extension is genuinely
-// sufficient.
+// manifest patterns match.
+//
+// Re-injection only helps if the script actually re-arms on it, which is the other
+// half of the story and lives in the scripts themselves: the isolated world -- and
+// the registry they guard themselves with -- survives an extension reload, so each
+// one has to REPLACE the timer its previous injection left behind rather than see a
+// flag already set and bail out. See cost.js.
+//
+// And injection reaches a frozen tab without running there, so bootstrap() at the
+// bottom follows it with a reload of the provider tabs. Those three things together
+// are what make reloading the extension genuinely sufficient.
 //
 // The script list is read from the manifest at runtime rather than duplicated
 // here, so adding a provider means touching manifest.json only.
@@ -50,8 +59,7 @@ async function injectIntoOpenTabs(reason) {
   console.log(`[claude-usage] ${reason}: injected into ${injected} open tab(s)`);
 }
 
-chrome.runtime.onInstalled.addListener((d) => injectIntoOpenTabs(d.reason));
-chrome.runtime.onStartup.addListener(() => injectIntoOpenTabs("startup"));
+// Registered at the bottom of this file, alongside the rest of bootstrap().
 
 // --- Usage polling ---------------------------------------------------------
 //
@@ -128,17 +136,119 @@ async function pollUsage() {
   }
 }
 
+// --- Provider page reloads -------------------------------------------------
+//
+// The cost scrapers read a number out of a rendered page, and none of those pages
+// renders it twice. platform.claude.com, the OpenAI limits page and AI Studio's
+// spend page each paint their figure at load and leave it there, so a tab opened
+// yesterday reports yesterday's number today no matter how often the scraper
+// re-reads the DOM. Worse, an SPA left open long enough drifts -- session expiry,
+// a re-render into an error state -- and then the scrape finds nothing, the
+// scraper posts nothing (deliberately: a missing figure must not be published as
+// zero), that service's arrival stamp stops advancing, and the menu flags the row.
+// Nothing recovers it, because recovery requires a reload.
+//
+// A launchd job used to drive this over AppleScript, but only for the Claude cost
+// tab -- OpenAI and Gemini were never reloaded at all, and AppleScript needs
+// Automation permission per browser to do anything. The worker already knows every
+// tab the extension scrapes, so it reloads them itself.
+//
+// Reloading is also the only thing that gets these tabs reporting at all. Chromium
+// freezes background tabs (Dia aggressively) and a frozen tab runs no setInterval,
+// so a scraper's 60s poll stops dead -- the same failure that moved usage polling
+// in here. Measured on a backgrounded Dia: each reloaded tab posts once, ~2s after
+// load, and then goes silent until the next reload. So this alarm is not a
+// safety net behind the page timers; it IS the reporting cadence, and the page
+// timers only contribute while a tab happens to be awake.
+const RELOAD_ALARM = "provider-page-reload";
+
+// Comfortably under the menu's 15-minute per-service staleness threshold. Because
+// a frozen tab reports once per reload and no more, a row's age peaks just above
+// this figure -- so the gap between the two is the whole margin, and one skipped
+// cycle is exactly the kind of breakage the warning is meant to surface.
+const RELOAD_MINUTES = 10;
+
+// Every page the extension scrapes EXCEPT claude.ai: usage comes from the fetch
+// above and needs no tab, so reloading claude.ai would buy nothing and throw away
+// whatever conversation is open there. Derived from the manifest for the same
+// reason injectIntoOpenTabs is -- adding a provider stays a manifest-only change.
+function reloadMatches() {
+  const { content_scripts: scripts = [] } = chrome.runtime.getManifest();
+  return scripts
+    .filter((cs) => cs.matches && cs.js && !cs.js.includes("usage.js"))
+    .flatMap((cs) => cs.matches);
+}
+
+async function reloadProviderPages() {
+  const matches = reloadMatches();
+  if (!matches.length) return;
+
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: matches });
+  } catch (e) {
+    console.warn("[claude-usage] reload query failed for", matches, e);
+    return;
+  }
+
+  // Every match, including whatever tab is active. An earlier version skipped the
+  // active tab of the last-focused window, on the theory that a tab you are looking
+  // at is neither frozen nor worth reloading under you. Measured: with Dia in the
+  // background its last-focused window still reports focused, so the OpenAI tab --
+  // active in that window -- was skipped every cycle and went 20 minutes without
+  // reporting while the other two recovered on schedule. A tab that never refreshes
+  // is the whole bug; a dashboard blinking every 10 minutes is not, and these three
+  // pages hold no form state to lose.
+  for (const tab of tabs) {
+    if (!tab.id) continue;
+    try {
+      await chrome.tabs.reload(tab.id);
+    } catch (e) {
+      // Tab closed or navigated away mid-loop; the next alarm sees the new set.
+      console.warn("[claude-usage] reload failed for tab", tab.id, e);
+    }
+  }
+}
+
+// --- Alarms ----------------------------------------------------------------
+
 // periodInMinutes: 1 is the floor Chrome honours for a released extension, and
 // is exactly the cadence we want. Created only when absent: re-creating on every
 // worker start would reset the schedule each time the worker is woken.
 chrome.alarms.get(USAGE_ALARM).then((a) => {
   if (!a) chrome.alarms.create(USAGE_ALARM, { periodInMinutes: 1 });
 });
+chrome.alarms.get(RELOAD_ALARM).then((a) => {
+  if (!a) {
+    chrome.alarms.create(RELOAD_ALARM, { periodInMinutes: RELOAD_MINUTES });
+  }
+});
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === USAGE_ALARM) pollUsage();
+  if (a.name === RELOAD_ALARM) reloadProviderPages();
 });
 
-// Poll immediately on install/update/startup so a fresh browser doesn't sit on
-// stale numbers for a minute waiting for the first alarm.
-chrome.runtime.onInstalled.addListener(() => pollUsage());
-chrome.runtime.onStartup.addListener(() => pollUsage());
+// --- Bootstrap -------------------------------------------------------------
+
+// Runs on install, on update (which is what an unpacked reload fires), and at
+// browser startup.
+//
+// The reload at the end is not redundant with the injection at the start.
+// Injecting a script into a FROZEN tab delivers it but does not run it -- nothing
+// runs there until the tab is resumed. Measured across an extension reload with
+// Dia in the background: the one provider tab that happened to be visible posted
+// within 2s of injection, while the two frozen ones stayed silent for the entire
+// alarm period. A reload resumes them.
+//
+// It also realigns the tabs with the alarm. Chrome clears an extension's alarms on
+// update, so the alarm recreated above does not fire for a full RELOAD_MINUTES --
+// long enough, from a standing start, for a row to cross the staleness threshold
+// before its first scheduled reload ever lands.
+async function bootstrap(reason) {
+  await injectIntoOpenTabs(reason);
+  pollUsage();
+  reloadProviderPages();
+}
+
+chrome.runtime.onInstalled.addListener((d) => bootstrap(d.reason));
+chrome.runtime.onStartup.addListener(() => bootstrap("startup"));

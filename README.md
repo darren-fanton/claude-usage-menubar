@@ -54,7 +54,10 @@ real zero. The distinction matters for any provider whose billing reports on a d
 Both scrape the rendered page — neither console exposes a JSON endpoint a content script
 can call directly. Each posts only its own key, and the server merges the `cost` object
 per service, so one provider updating never wipes another's figure. Those tabs need to
-stay open; the Claude one is reloaded every 30 minutes since spend moves slowly.
+stay open, and the extension reloads each of them every 10 minutes. None of the three
+pages repaints its figure after load, and a tab Chromium has frozen runs no scrape timer
+at all, so on a backgrounded browser the reload cycle is what actually produces each
+row's number.
 
 The extension and the local server are optional: without them the menu bar still works
 from the OAuth API alone, just at ~5-minute resolution and with no API Cost rows.
@@ -143,8 +146,21 @@ verbatim. With several claude.ai tabs open, a `localStorage` lease elects a sing
 so it stays at one request per minute in total, not one per tab.
 
 `cost.js` posts `cost.claude`, `openai.js` posts `cost.openai`, `gemini.js` posts
-`cost.gemini` — each only its own key. A LaunchAgent reloads the Claude console tab every
-30 minutes (see INSTALL.md); the OpenAI and AI Studio pages update themselves.
+`cost.gemini` — each only its own key.
+
+`background.js` reloads every scraped tab except `claude.ai` on a 10-minute alarm. Three
+things depend on it: the figures only change at load; a page left open long enough drifts
+into a state the scrape cannot read, after which that scraper posts nothing at all and the
+row is flagged; and a tab Chromium has frozen runs no scrape timer until something resumes
+it — on a backgrounded browser a reloaded tab posts once and then goes quiet, so the
+10-minute cycle is the reporting cadence and the 15-minute staleness threshold is the
+margin around it.
+
+Each scraper stores its timer ids on a per-tab registry rather than an "already ran" flag,
+so the re-injection `background.js` performs on extension reload replaces the previous
+timer instead of deferring to one whose extension context has just been torn down. That
+re-injection is followed by a reload of the provider tabs, because injecting into a frozen
+tab delivers the script without running it.
 
 Verify:
 
@@ -268,11 +284,9 @@ claude-usage-menubar/
 │   └── gemini.js                       # scrapes AI Studio monthly spend
 ├── server/
 │   ├── server.js
-│   ├── io.claude-usage.server.plist    # template — see install steps
-│   └── io.claude-usage.refresh.plist   # template — 30 min cost-tab reload
+│   └── io.claude-usage.server.plist    # template — see install steps
 └── swiftbar/
-    ├── claude-usage.60s.sh             # menu bar plugin; calls the usage API
-    └── refresh-usage.sh                # reloads the cost tab
+    └── claude-usage.60s.sh             # menu bar plugin; calls the usage API
 ```
 
 ---

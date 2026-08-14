@@ -19,14 +19,18 @@
 // `$rpc/...MakerSuiteService` backend, which is not practical to call directly.
 
 (() => {
-  // Guard against running twice in one tab. background.js retrofits open tabs when
-  // the extension reloads, and a tab that loaded normally already has us. All of an
-  // extension's content scripts share a single isolated world per tab, so a global
-  // flag is enough -- without it the second run starts a second timer and we POST
-  // twice a minute.
+  // Exactly one live timer per tab, and it must belong to the CURRENT extension
+  // context. background.js re-injects into open tabs on every extension reload, but
+  // the isolated world holding this registry outlives that reload -- so a plain
+  // "already ran, bail out" flag turned re-injection into a no-op that deferred to
+  // a timer whose context had just been torn down and could no longer reach the
+  // server. Holding the timer ids makes re-injection a replacement instead. See
+  // cost.js for the full account.
   const _reg = (globalThis.__claudeUsageMenubar ||= {});
-  if (_reg.gemini) return;
-  _reg.gemini = true;
+  if (_reg.gemini) {
+    clearTimeout(_reg.gemini.first);
+    clearInterval(_reg.gemini.poll);
+  }
 
   const ENDPOINT = "http://localhost:7823/usage";
   const POLL_MS = 60_000;
@@ -107,6 +111,8 @@
     }
   }
 
-  setTimeout(send, 2500);
-  setInterval(send, POLL_MS);
+  _reg.gemini = {
+    first: setTimeout(send, 2500),
+    poll: setInterval(send, POLL_MS),
+  };
 })();

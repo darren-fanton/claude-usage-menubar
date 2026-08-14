@@ -88,9 +88,10 @@ svg_to_b64() {
 # --- Cost + pushed usage: read the local server first ---
 # The usage endpoint carries no console spend figure -- its `spend` field is
 # prepaid credits, a different number -- so the API Cost rows still come from
-# cost.js scraping platform.claude.com into the local server. Month-to-date spend
-# moves slowly, so that page is reloaded every 30 min (see refresh-usage.sh)
-# rather than every 60s like the old usage scrape.
+# cost.js scraping platform.claude.com into the local server. That page only paints
+# its figure at load, so the extension's service worker reloads it -- and every
+# other scraped provider tab -- every 10 min, comfortably inside the
+# COST_STALE_MAX window below.
 COST_JSON=$(curl -fsS --max-time 2 "http://localhost:7823/usage" 2>/dev/null)
 
 # --- Preferred usage source: pushed by the extension ---
@@ -320,8 +321,9 @@ for r in rows:
 # not updating. Each scraper POSTs every 60s while its tab is open and posts
 # NOTHING when the scrape fails, so anything past a few minutes means that one
 # provider's pipeline is down (tab closed, logged out, markup moved) even while
-# the others keep reporting. 15 min tolerates the 30-min page reload cycle's
-# in-flight gaps without sitting on a genuine break for long.
+# the others keep reporting. 15 min sits just past the extension's 10-minute tab
+# reload cycle, so a provider that has gone quiet gets one whole reload attempt --
+# frozen tab resumed, drifted page re-rendered -- before its row is flagged.
 COST_STALE_MAX=900
 
 # Human age from a seconds count: "just now" / "5 min ago" / "3h ago" / "2d ago".

@@ -11,14 +11,25 @@
 // provider.
 
 (() => {
-  // Guard against running twice in one tab. background.js retrofits open tabs when
-  // the extension reloads, and a tab that loaded normally already has us. All of an
-  // extension's content scripts share a single isolated world per tab, so a global
-  // flag is enough -- without it the second run starts a second timer and we POST
-  // twice a minute.
+  // Exactly one live timer per tab, and it must belong to the CURRENT extension
+  // context.
+  //
+  // background.js re-injects into open tabs whenever the extension reloads, and the
+  // isolated world -- this registry with it -- outlives that reload; only a page
+  // navigation clears it. So a plain "already ran, bail out" flag made every
+  // re-injection a no-op, deferring to a timer whose extension context had just
+  // been torn down and which could no longer reach the server. Silent by
+  // construction: reloading the extension killed this scraper until someone
+  // reloaded the tab by hand, and the menu just showed a stale figure.
+  //
+  // Holding the timer ids instead of a boolean makes re-injection a REPLACEMENT --
+  // cancel what the previous injection left running, then arm our own. Still one
+  // timer, so the double-POST the old guard existed to prevent stays prevented.
   const _reg = (globalThis.__claudeUsageMenubar ||= {});
-  if (_reg.cost) return;
-  _reg.cost = true;
+  if (_reg.cost) {
+    clearTimeout(_reg.cost.first);
+    clearInterval(_reg.cost.poll);
+  }
 
   const ENDPOINT = "http://localhost:7823/usage";
   const POLL_MS = 60_000;
@@ -102,6 +113,8 @@
   }
 
   // Wait for the chart to render, then poll.
-  setTimeout(send, 2000);
-  setInterval(send, POLL_MS);
+  _reg.cost = {
+    first: setTimeout(send, 2000),
+    poll: setInterval(send, POLL_MS),
+  };
 })();
