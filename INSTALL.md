@@ -46,6 +46,7 @@ The user must already have, or be willing to install:
 - **[SwiftBar](https://github.com/swiftbar/SwiftBar)** — open the App Store link or `brew install --cask swiftbar`. The user must launch it once and grant permissions.
 - **Claude Code, logged in.** The plugin reads its OAuth token from the keychain. Verify with the command below — it must print JSON, not an error.
 - **Recommended for the crisp pie-chart icon**: `librsvg` and `imagemagick` (`brew install librsvg imagemagick`). Without `librsvg`, the script falls back to a fuzzier 14×14 raster icon.
+- **Strongly recommended**: `pngquant` (`brew install pngquant`). It halves the size of every menu image. SwiftBar retains each bitmap it is handed for the life of the process, so the payload per refresh is what eventually degrades the display — see Step 3b. Without it the menu is identical, just twice as heavy.
 
 For per-minute usage updates and the optional API Cost rows:
 
@@ -64,7 +65,7 @@ If that fails, the plugin cannot fetch usage — have the user log in to Claude 
 Run a single batched check first:
 
 ```bash
-which node; which jq; which rsvg-convert; which magick; ls /Applications/SwiftBar.app 2>/dev/null
+which node; which jq; which rsvg-convert; which magick; which pngquant; ls /Applications/SwiftBar.app 2>/dev/null
 ```
 
 Report what's missing and offer to install it. **Do not install anything without explicit user approval.**
@@ -151,7 +152,32 @@ ln -sf "$PROJECT_DIR/swiftbar/claude-usage.60s.sh" \
 # Refresh: SwiftBar menu bar icon → Refresh All
 ```
 
-The filename's `.30s.` suffix tells SwiftBar to re-run it every 30 seconds.
+The filename's `.60s.` suffix tells SwiftBar to re-run it every 60 seconds.
+
+## Step 3b — Install the SwiftBar restart agent
+
+**Do not skip this.** SwiftBar 2.0.1 never releases the bitmaps a plugin hands it: every refresh's images are retained for the life of the process, and at a 60s cadence the pile grows until WindowServer's compositing cost climbs and the whole display starts to stutter — in other apps, not just the menu bar. Quitting SwiftBar clears it instantly, which is the only lever available from outside the app.
+
+Measured at one refresh per second with byte-identical output, WindowServer CPU rose 48.5% → 68.5% over 360 refreshes with the images present, and stayed flat (45.8% → 45.2%) with the dropdown images removed. `pngquant` halves what accumulates; this agent bounds it.
+
+```bash
+RESTART_SCRIPT="$PROJECT_DIR/swiftbar/restart-swiftbar.sh"
+
+sed -e "s|__RESTART_SCRIPT_PATH__|$RESTART_SCRIPT|" \
+    -e "s|__HOME__|$HOME|g" \
+    "$PROJECT_DIR/swiftbar/io.claude-usage.swiftbar-restart.plist" \
+  > ~/Library/LaunchAgents/io.claude-usage.swiftbar-restart.plist
+
+launchctl bootout   gui/$UID/io.claude-usage.swiftbar-restart 2>/dev/null
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/io.claude-usage.swiftbar-restart.plist
+
+# A clean exit is not evidence — kick it and confirm SwiftBar's pid changes
+pgrep -x SwiftBar
+launchctl kickstart gui/$UID/io.claude-usage.swiftbar-restart
+sleep 6; pgrep -x SwiftBar
+```
+
+It fires every 4 hours and is a no-op when SwiftBar isn't running, so a deliberate quit stays quit. Logs: `~/Library/Logs/claude-usage-swiftbar-restart.log`.
 
 ### What the user will see
 
@@ -197,6 +223,8 @@ claude-usage-menubar/
 │   └── io.claude-usage.server.plist      # template — see Step 1
 └── swiftbar/
     ├── claude-usage.60s.sh               # the menu bar plugin
+    ├── restart-swiftbar.sh               # 4h restart; frees retained images
+    ├── io.claude-usage.swiftbar-restart.plist   # template — see Step 3b
     ├── icon.svg
     ├── claude-logo-source.png
     ├── menubar-icon.png
@@ -217,6 +245,15 @@ tail -5 ~/Library/Logs/claude-usage-server.log
 
 # 4. SwiftBar plugin renders without errors
 bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.60s.sh" | head -20
+
+# 5. Restart agent is loaded and its interval is 4h
+launchctl print gui/$UID/io.claude-usage.swiftbar-restart | grep -E 'program|run interval'
+
+# 6. Images are palette-quantized (PaletteAlpha, not truecolour) and still 144 DPI
+rm -f ~/.cache/claude-usage/menu.txt
+bash "$HOME/Library/Application Support/SwiftBar/Plugins/claude-usage.60s.sh" \
+  | sed -n 's/.*image=\([A-Za-z0-9+/=]*\).*/\1/p' | head -1 | base64 -d \
+  | magick identify -format '%[type] %x\n' -
 ```
 
 ## Troubleshooting

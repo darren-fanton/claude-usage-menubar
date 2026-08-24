@@ -79,6 +79,7 @@ Needed for per-minute usage updates and the optional **API Cost** rows:
 - [Node.js](https://nodejs.org) (any modern version; only the standard library is used)
 - Google Chrome (or any Chromium-based browser that supports MV3 unpacked extensions)
 - **For the crisp vector pie-chart icon:** `librsvg` and `imagemagick` (both via Homebrew: `brew install librsvg imagemagick`). Without `librsvg`, the script falls back to a slightly fuzzier 14×14 raster icon.
+- **Strongly recommended:** `pngquant` (`brew install pngquant`) — halves the size of every menu image. SwiftBar retains each bitmap it is handed for the life of the process, so the payload per refresh is what eventually degrades the display (see [Why SwiftBar gets restarted](#why-swiftbar-gets-restarted)). Without it the menu looks identical, just twice as heavy.
 
 ---
 
@@ -212,6 +213,42 @@ ln -sf "$HOME/Projects/claude-usage-menubar/swiftbar/claude-usage.60s.sh" \
 
 The filename's `.60s.` suffix tells SwiftBar to re-run it every 60 seconds.
 
+### Why SwiftBar gets restarted
+
+SwiftBar 2.0.1 never releases the bitmaps a plugin hands it. Every refresh's images are retained for the life of the process, so a 60s cadence accumulates them until WindowServer's compositing cost climbs and the whole display starts to stutter — in other apps, not just the menu bar.
+
+Measured on this plugin, at one refresh per second with byte-identical output each time:
+
+| menu payload | WindowServer CPU over 360 refreshes | SwiftBar RSS |
+| --- | --- | --- |
+| 11 images, 27.7 KB | 48.5% → 68.5% | 57 → 74 MB |
+| menu-bar pie only | 45.8% → 45.2% (flat) | 58 → 60 MB |
+| no images at all | 47.2% → 45.8% (flat) | 59 → 67 MB |
+
+Two things keep it in check:
+
+1. **`png_quantize` in the plugin** palette-quantizes every image, halving the payload (27.7 KB → ~14 KB per refresh) at 0.2% RMSE from the truecolour original. It uses `pngquant` rather than ImageMagick's `PNG8` because `PNG8` collapses alpha to binary — 234 alpha levels → 1 on a reset caption — which destroys the text antialiasing and the bar's translucent track.
+2. **A LaunchAgent restarts SwiftBar every 4 hours**, dropping the retained pile (~2.5 MB by then) at once.
+
+```bash
+RESTART_SCRIPT="$HOME/Projects/claude-usage-menubar/swiftbar/restart-swiftbar.sh"
+
+sed -e "s|__RESTART_SCRIPT_PATH__|$RESTART_SCRIPT|" \
+    -e "s|__HOME__|$HOME|g" \
+    "$HOME/Projects/claude-usage-menubar/swiftbar/io.claude-usage.swiftbar-restart.plist" \
+  > ~/Library/LaunchAgents/io.claude-usage.swiftbar-restart.plist
+
+launchctl bootout   gui/$UID/io.claude-usage.swiftbar-restart 2>/dev/null
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/io.claude-usage.swiftbar-restart.plist
+
+# Prove it actually fires, rather than trusting a clean exit
+launchctl kickstart gui/$UID/io.claude-usage.swiftbar-restart
+```
+
+The restart is a no-op when SwiftBar isn't running, so quitting it stays a deliberate act — the timer won't resurrect it. Logs land at `~/Library/Logs/claude-usage-swiftbar-restart.log`.
+
+To uninstall: `launchctl bootout gui/$UID/io.claude-usage.swiftbar-restart && rm ~/Library/LaunchAgents/io.claude-usage.swiftbar-restart.plist`.
+
 ### What you'll see
 
 **Menu bar:** a pie-chart icon showing elapsed session time, plus the session percent
@@ -286,7 +323,9 @@ claude-usage-menubar/
 │   ├── server.js
 │   └── io.claude-usage.server.plist    # template — see install steps
 └── swiftbar/
-    └── claude-usage.60s.sh             # menu bar plugin; calls the usage API
+    ├── claude-usage.60s.sh             # menu bar plugin; calls the usage API
+    ├── restart-swiftbar.sh             # 4h restart; frees SwiftBar's retained images
+    └── io.claude-usage.swiftbar-restart.plist   # template — see install steps
 ```
 
 ---

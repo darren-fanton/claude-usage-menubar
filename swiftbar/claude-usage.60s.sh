@@ -50,13 +50,47 @@ trap 'mv -f "$CACHE_TMP" "$CACHE" 2>/dev/null; cat "$CACHE" >&3 2>/dev/null' EXI
 # disk keyed by the inputs that determine it, so a steady state spawns ~0
 # rsvg-convert processes instead of 19. The dir is versioned so a change to the
 # image-drawing code (bump IMG_V) invalidates every stale cached image at once.
-IMG_V=2
+IMG_V=3
 IMGCACHE="$HOME/.cache/claude-usage/img/v$IMG_V"
 mkdir -p "$IMGCACHE"
 # Reset-countdown strings change each minute, so their images accumulate; evict
 # anything older than a day. One find per real render is negligible next to the
 # ~19 rsvg-convert calls the cache removes.
 find "$IMGCACHE" -type f -mtime +1 -delete 2>/dev/null
+
+# --- PNG palette quantization ---
+# SwiftBar never releases the bitmaps a plugin hands it: every refresh's images
+# are retained for the life of the process, so a 60s cadence accumulates them
+# until WindowServer's compositing cost climbs and the whole display glitches.
+# Measured: WindowServer CPU rose from 48% to 68% over 360 refreshes with these
+# images, and stayed flat when they were removed. The payload per refresh is
+# therefore a first-class cost, not just bytes on a pipe.
+#
+# So squeeze it. These are flat-colour graphics -- a few fills plus antialiased
+# edges -- which a palette PNG carries in about half the bytes. pngquant is used
+# rather than ImageMagick's PNG8 because PNG8 gets its win by collapsing alpha to
+# binary: measured 234 alpha levels -> 1 on a reset caption, which throws away the
+# text antialiasing and the bar's translucent track. pngquant writes a real
+# multi-level tRNS, so the result is 0.2% RMSE from the truecolour original
+# against both light and dark menu backgrounds, versus 3-12% for PNG8.
+#
+# pngquant is optional: without it (or if it declines the job, which it does when
+# it cannot hit the quality floor) the original PNG passes through untouched and
+# the menu is identical, just heavier.
+png_quantize() {
+  local raw q
+  raw=$(mktemp "${TMPDIR:-/tmp}/claude-usage-png.XXXXXX") || { cat; return; }
+  q="$raw.q"
+  cat > "$raw"
+  if command -v pngquant >/dev/null 2>&1 \
+     && pngquant --quality=60-95 --speed 1 --output "$q" -- "$raw" 2>/dev/null \
+     && [ -s "$q" ]; then
+    cat "$q"
+  else
+    cat "$raw"
+  fi
+  rm -f "$raw" "$q"
+}
 
 # --- SVG -> base64 PNG ---
 # Renders $1 (SVG source) to a 2x PNG and stamps it 144 DPI, so NSImage reports the
@@ -75,12 +109,14 @@ svg_to_b64() {
     printf '%s' "$svg" \
       | rsvg-convert --format=png -w "$w2" -h "$h2" 2>/dev/null \
       | magick png:- -density 144 -units PixelsPerInch png:- 2>/dev/null \
+      | png_quantize \
       | base64 | tr -d '\n'
   else
     # No librsvg: rasterize with ImageMagick alone, same 2x-at-144-DPI contract.
     printf '%s' "$svg" \
       | magick -background none -density 800 svg:- -filter Lanczos \
                -resize "${w2}x${h2}" -density 144 -units PixelsPerInch png:- 2>/dev/null \
+      | png_quantize \
       | base64 | tr -d '\n'
   fi
 }

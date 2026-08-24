@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.claude-usage.swiftbar-restart</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RESTART_SCRIPT_PATH__</string>
+  </array>
+
+  <!-- Every 4 hours. SwiftBar retains every menu image it is ever handed, so
+       this bounds the pile at ~240 refreshes' worth (~2.5MB) rather than letting
+       it grow for the life of the login session. RunAtLoad is deliberately
+       absent: loading the agent should not bounce a SwiftBar that is running
+       fine. -->
+  <key>StartInterval</key>
+  <integer>14400</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/claude-usage-swiftbar-restart.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/claude-usage-swiftbar-restart.log</string>
+</dict>
+</plist>
