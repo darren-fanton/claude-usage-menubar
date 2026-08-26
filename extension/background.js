@@ -139,8 +139,8 @@ async function pollUsage() {
 // --- Provider page reloads -------------------------------------------------
 //
 // The cost scrapers read a number out of a rendered page, and none of those pages
-// renders it twice. platform.claude.com, the OpenAI limits page and AI Studio's
-// spend page each paint their figure at load and leave it there, so a tab opened
+// renders it twice. platform.claude.com/cost, the OpenAI limits page and AI
+// Studio's billing page each paint their figure at load and leave it there, so a tab opened
 // yesterday reports yesterday's number today no matter how often the scraper
 // re-reads the DOM. Worse, an SPA left open long enough drifts -- session expiry,
 // a re-render into an error state -- and then the scrape finds nothing, the

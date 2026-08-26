@@ -11,7 +11,7 @@ extension content scripts ──POST──▶ localhost:7823 ──GET──▶ 
   usage.js   → plan usage, any claude.ai tab, 60s                 (bash plugin)
   cost.js    → Claude console spend                                    │
   openai.js  → OpenAI project spend                                    │
-  gemini.js  → Gemini monthly spend                                    │
+  gemini.js  → Gemini billing cost                                     │
                                                                        │
 Claude OAuth usage API ───────────GET (fallback, ≤1 per 5 min)─────────┘
 ```
@@ -24,7 +24,7 @@ consumers, so it cannot drive a 60s cadence on its own. Both return the same pay
 
 **API cost** is one row per service, scraped by a content script per provider:
 `cost.js` from the Claude console, `openai.js` from the OpenAI project Limits page,
-`gemini.js` from the Google AI Studio Spend page (which Google updates up to 24h late). Each
+`gemini.js` from the Google AI Studio Billing page (which Google updates up to 24h late). Each
 posts only its own key and the server merges `cost` per service, so providers never
 overwrite each other. Neither console exposes a JSON endpoint a content script can call,
 so both are DOM scrapes and need their tab left open.
@@ -120,7 +120,7 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 4. Open one tab per provider they want a cost row for, and leave each open:
    - <https://platform.claude.com/cost> → `cost.claude`
    - `https://platform.openai.com/settings/<project>/limits` → `cost.openai`
-   - <https://aistudio.google.com/spend> → `cost.gemini`
+   - <https://aistudio.google.com/u/<n>/billing> → `cost.gemini`
 
 Costs are tracked **per service, one row each** — never broken down by model. Any writer can add a provider by POSTing its own key (`cost.gemini`, …); the menu renders a row per numeric key it finds and needs no change.
 
@@ -214,7 +214,7 @@ claude-usage-menubar/
 │   ├── background.js                     # retrofits scripts into already-open tabs
 │   ├── usage.js                          # pushes plan usage from any claude.ai tab
 │   ├── openai.js                         # scrapes OpenAI project spend
-│   ├── gemini.js                         # scrapes AI Studio monthly spend
+│   ├── gemini.js                         # scrapes AI Studio billing cost
 │   ├── cost.js                           # scrapes console month-to-date spend
 │   ├── cost.js                           # scrapes platform.claude.com cost page
 │   └── icons/

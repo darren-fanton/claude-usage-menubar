@@ -7,7 +7,7 @@ extension content scripts ──POST──▶ localhost:7823 ──GET──▶ 
   usage.js   → plan usage, any claude.ai tab, 60s                 (bash plugin)
   cost.js    → Claude console spend                                    │
   openai.js  → OpenAI project spend                                    │
-  gemini.js  → Gemini monthly spend                                    │
+  gemini.js  → Gemini billing cost                                     │
                                                                        │
 Claude OAuth usage API ───────────GET (fallback, ≤1 per 5 min)─────────┘
 ```
@@ -39,14 +39,15 @@ and it degrades to ~5-minute updates rather than breaking.
 
 | Row | Source | Figure |
 |---|---|---|
-| `Claude:` | `platform.claude.com/workspaces/*/cost` | month-to-date token cost |
+| `Claude:` | `platform.claude.com/cost` | month-to-date total cost (tokens + web search + code execution) |
 | `OpenAI:` | `platform.openai.com/settings/*/limits` | current project spend (the `$X` of `$X / $limit`) |
-| `Gemini:` | `aistudio.google.com/**/spend` | monthly spend from the "Monthly spend cap" card |
+| `Gemini:` | `aistudio.google.com/**/billing` | month-to-date "Total cost" from the "Billing Account Cost for Gemini API" card |
 
-> **Gemini lags.** Google states costs "take a few hours to show up, and might take longer
-> than 24 hours". Until the figure reports, the page shows `-` and the menu shows `Gemini: -`
-> rather than `$0.00` — "not reported yet" and "you spent nothing" must not look alike. The
-> row also carries a tooltip about the delay. A genuine zero still renders as `$0.00`.
+> **Gemini lags.** The billing card itself says "Cost information may take up to 24 hours to
+> update", so this row can read `$0.00` while spend is actually accruing. The row carries a
+> tooltip saying so. When the card can't be read at all the scraper posts *nothing* rather
+> than a zero — "not reported yet" and "you spent nothing" must not look alike — and the
+> row's per-service age stops advancing, which is what raises the ⚠️.
 
 A service may post `null` to mean "no figure yet"; that renders as `-`. Posting `0` means a
 real zero. The distinction matters for any provider whose billing reports on a delay.
@@ -140,7 +141,7 @@ Skip only if ~5-minute usage updates are fine and you don't want the API Cost ro
 5. For the API Cost rows, leave open whichever provider pages you want rows for:
    - <https://platform.claude.com/cost> → `Claude:`
    - `https://platform.openai.com/settings/<project>/limits` → `OpenAI:`
-   - `https://aistudio.google.com/spend?project=<project>` → `Gemini:`
+   - `https://aistudio.google.com/u/<n>/billing` → `Gemini:`
 
 `usage.js` calls claude.ai's own `/api/organizations/<org>/usage` and POSTs the JSON
 verbatim. With several claude.ai tabs open, a `localStorage` lease elects a single poller
@@ -318,7 +319,7 @@ claude-usage-menubar/
 │   ├── usage.js                        # pushes plan usage from any claude.ai tab
 │   ├── cost.js                         # scrapes platform.claude.com spend
 │   ├── openai.js                       # scrapes platform.openai.com project spend
-│   └── gemini.js                       # scrapes AI Studio monthly spend
+│   └── gemini.js                       # scrapes AI Studio billing cost
 ├── server/
 │   ├── server.js
 │   └── io.claude-usage.server.plist    # template — see install steps
@@ -334,7 +335,7 @@ claude-usage-menubar/
 
 - **"No Claude Code credentials in keychain"** — the plugin couldn't read the OAuth token. Confirm Claude Code is logged in and that `security find-generic-password -s "Claude Code-credentials" -w` returns JSON.
 - **"Could not reach the usage API"** — the token was found but the call failed. Most often the token expired and Claude Code hasn't refreshed it yet; run any Claude Code command and it renews. Reproduce with the `curl` in §2.
-- **Usage percentages are right but API Cost rows are missing** — that's the extension half. Check the server (`curl http://localhost:7823/usage`) and that a `platform.claude.com/workspaces/*/cost` tab is open. Note the payload must use per-service keys (`cost.claude`); the older `cost.totalUSD` shape is ignored.
+- **Usage percentages are right but API Cost rows are missing** — that's the extension half. Check the server (`curl http://localhost:7823/usage`) and that a `platform.claude.com/cost` tab is open. Note the payload must use per-service keys (`cost.claude`); the older `cost.totalUSD` shape is ignored.
 - **Footer stuck on `(cached)`** — the usage API keeps failing. Usually HTTP 429 from too many calls; raise `USAGE_TTL` in the plugin. Check the live status with the `curl` in §2.
 - **A provider row never appears** — its content script probably isn't running in that tab. `background.js` retrofits scripts into already-open tabs on reload, so a plain extension reload should be enough; if a row is still missing, reload that tab and check `chrome://extensions` for errors on the service worker.
 - **Removing a content script doesn't stop it** — Chromium leaves already-injected scripts running in open tabs, orphaned, until those tabs reload. `background.js` can add scripts to open tabs but cannot remove them.
