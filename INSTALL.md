@@ -120,7 +120,7 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 4. Open one tab per provider they want a cost row for, and leave each open:
    - <https://platform.claude.com/cost> → `cost.claude`
    - `https://platform.openai.com/settings/<project>/limits` → `cost.openai`
-   - <https://aistudio.google.com/u/<n>/billing> → `cost.gemini`
+   - <https://aistudio.google.com/u/0/billing> → `cost.gemini`
 
 Costs are tracked **per service, one row each** — never broken down by model. Any writer can add a provider by POSTing its own key (`cost.gemini`, …); the menu renders a row per numeric key it finds and needs no change.
 

@@ -141,7 +141,7 @@ Skip only if ~5-minute usage updates are fine and you don't want the API Cost ro
 5. For the API Cost rows, leave open whichever provider pages you want rows for:
    - <https://platform.claude.com/cost> → `Claude:`
    - `https://platform.openai.com/settings/<project>/limits` → `OpenAI:`
-   - `https://aistudio.google.com/u/<n>/billing` → `Gemini:`
+   - `https://aistudio.google.com/u/0/billing` → `Gemini:`
 
 `usage.js` calls claude.ai's own `/api/organizations/<org>/usage` and POSTs the JSON
 verbatim. With several claude.ai tabs open, a `localStorage` lease elects a single poller
