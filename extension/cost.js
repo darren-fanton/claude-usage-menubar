@@ -1,9 +1,16 @@
-// Scrapes API workspace cost from platform.claude.com/workspaces/*/cost ONLY.
-// Both the manifest match and the onCostPage() guard below enforce that: an
-// earlier build matched all of platform.claude.com, so it also ran on /docs/*
-// pages and posted numbers parsed out of their Next.js hydration payload.
-// Reads the total month-to-date cost from the "Total token cost" card and POSTs it
-// as `cost.claude` into the local server payload.
+// Scrapes API cost from platform.claude.com/cost ONLY. Both the manifest match
+// and the onCostPage() guard below enforce that: an earlier build matched all of
+// platform.claude.com, so it also ran on /docs/* pages and posted numbers parsed
+// out of their Next.js hydration payload.
+//
+// The console moved this page in Aug 2026: it used to live at
+// /workspaces/<id>/cost, which now renders an empty shell -- the heading paints,
+// the data never arrives. Cost is org-wide and lives at /cost. The old URL is not
+// matched at all, so a tab left open on it stops being scraped rather than being
+// reloaded every 10 minutes for nothing.
+//
+// Reads the month-to-date total from the "Total cost" card and POSTs it as
+// `cost.claude` into the local server payload.
 //
 // There is deliberately no per-model breakdown. It used to walk the Chart.js donut
 // and hover each slice to read tooltips, which was ~100 lines of fragile DOM poking
@@ -39,35 +46,69 @@
   // path before every scrape so we never read numbers off some other console
   // page and POST them as spend.
   function onCostPage() {
-    return /^\/workspaces\/[^/]+\/cost\/?$/.test(location.pathname);
+    return /^\/cost\/?$/.test(location.pathname);
   }
 
   // -- Total cost ----------------------------------------------------------
 
-  function readTotal() {
-    const labels = Array.from(document.querySelectorAll("h1, h2, h3, label"));
-    const labelEl = labels.find(
-      (el) => el.textContent.trim().toLowerCase() === "total token cost"
-    );
-    if (!labelEl) return null;
-    // Walk up to a sibling/parent that holds the dollar value.
-    let scope = labelEl.parentElement;
-    for (let i = 0; i < 3 && scope; i++) {
-      const valEl = scope.querySelector(
-        ".text-3xl, .text-2xl, .text-4xl, [class*='text-3xl']"
-      );
-      if (valEl) {
-        const m = valEl.textContent.match(/\$([0-9]+(?:\.[0-9]+)?)/);
-        if (m) return parseFloat(m[1]);
+  // Card labels to read, in preference order. "Total cost" is the whole API bill
+  // -- tokens plus web search plus code execution -- which is what a single
+  // "Claude" row in the menu should say. "Total token cost" is the fallback for a
+  // layout that offers no combined figure; it under-reports by whatever the
+  // non-token lines come to.
+  const TOTAL_LABELS = ["total cost", "total token cost"];
+
+  // An element's visible label, with nested controls stripped. Each card heading
+  // wraps an info button whose accessible text ("More info about total cost")
+  // otherwise lands in textContent and defeats an equality match.
+  function labelText(el) {
+    if (el.children.length > 2) return "";
+    const clone = el.cloneNode(true);
+    clone
+      .querySelectorAll("button, [aria-hidden='true'], .sr-only")
+      .forEach((n) => n.remove());
+    return clone.textContent.trim().replace(/\s+/g, " ").toLowerCase();
+  }
+
+  // Find the card labelled `label` and read the dollar figure out of it.
+  //
+  // Deliberately class-free. The previous version keyed on Tailwind size classes
+  // (.text-3xl and friends) to find the value; the console's Aug 2026 redesign
+  // renamed every one of them, readTotal() returned null, and -- because a missing
+  // figure is deliberately never posted as zero -- the row simply stopped
+  // updating. It went unnoticed for nine days. Anchoring on the visible label and
+  // then taking the first currency-shaped leaf inside its card survives a
+  // restyle, which is the only thing about these pages that is predictable.
+  function readLabelled(label) {
+    // EVERY element whose visible text is the label, not just the first: the page
+    // carries more than one node reading "Total cost" (the card heading, and text
+    // inside the card's info popover), and only one of them sits in a card with a
+    // figure. Committing to the first match and returning null when it yields
+    // nothing is what made this silently read the token subtotal instead of the
+    // combined total.
+    const candidates = Array.from(
+      document.querySelectorAll("h1, h2, h3, h4, label, div, span")
+    ).filter((el) => labelText(el) === label);
+
+    for (const labelEl of candidates) {
+      // Widen from the label to its card, stopping at the first currency leaf.
+      let scope = labelEl.parentElement;
+      for (let i = 0; i < 4 && scope; i++) {
+        for (const el of scope.querySelectorAll("*")) {
+          if (el.children.length) continue;
+          const m = el.textContent.trim().match(/^\$([0-9,]+(?:\.[0-9]+)?)$/);
+          if (m) return parseFloat(m[1].replace(/,/g, ""));
+        }
+        scope = scope.parentElement;
       }
-      scope = scope.parentElement;
     }
-    // Fallback: any large $ amount on the page.
-    for (const el of document.querySelectorAll(
-      ".text-3xl, .text-2xl, .text-4xl"
-    )) {
-      const m = el.textContent.match(/\$([0-9]+(?:\.[0-9]+)?)/);
-      if (m) return parseFloat(m[1]);
+    return null;
+  }
+
+  function readTotal() {
+    for (const label of TOTAL_LABELS) {
+      const v = readLabelled(label);
+      if (v !== null) return v;
     }
     return null;
   }

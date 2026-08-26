@@ -124,7 +124,7 @@ svg_to_b64() {
 # --- Cost + pushed usage: read the local server first ---
 # The usage endpoint carries no console spend figure -- its `spend` field is
 # prepaid credits, a different number -- so the API Cost rows still come from
-# cost.js scraping platform.claude.com into the local server. That page only paints
+# cost.js scraping platform.claude.com/cost into the local server. That page only paints
 # its figure at load, so the extension's service worker reloads it -- and every
 # other scraped provider tab -- every 10 min, comfortably inside the
 # COST_STALE_MAX window below.
@@ -952,7 +952,7 @@ if [ -n "$COST_SERVICES" ]; then
   # in render_codex).
   printf '\xc2\xa0\n'
   # Orange pill title (full-color image; see the Claude header note).
-  echo " | image=$(generate_label_b64 "API Cost" "#f97316") href=\"https://platform.claude.com/workspaces/default/cost\""
+  echo " | image=$(generate_label_b64 "API Cost" "#f97316") href=\"https://platform.claude.com/cost\""
   _old_ifs="$IFS"; IFS=';'
   for _svc in $COST_SERVICES; do
     _name="${_svc%%=*}"

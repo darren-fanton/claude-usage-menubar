@@ -118,7 +118,7 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 2. Toggle **Developer mode** in the top right.
 3. Click **Load unpacked** and select the `extension/` folder inside this project.
 4. Open one tab per provider they want a cost row for, and leave each open:
-   - <https://platform.claude.com/workspaces/default/cost> → `cost.claude`
+   - <https://platform.claude.com/cost> → `cost.claude`
    - `https://platform.openai.com/settings/<project>/limits` → `cost.openai`
    - <https://aistudio.google.com/spend> → `cost.gemini`
 
@@ -201,7 +201,7 @@ Claude: $101.42
 Last Updated: 2 min ago
 ```
 
-(The cost block only appears if the user opened `platform.claude.com/workspaces/default/cost` and the cost-scraper script ran.)
+(The cost block only appears if the user opened `platform.claude.com/cost` and the cost-scraper script ran.)
 
 ## Project layout
 

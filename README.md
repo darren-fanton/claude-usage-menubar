@@ -138,7 +138,7 @@ Skip only if ~5-minute usage updates are fine and you don't want the API Cost ro
 4. Keep **any** claude.ai tab open — `usage.js` pushes plan usage from there every 60s.
    It does not have to be the usage settings page; any claude.ai page works.
 5. For the API Cost rows, leave open whichever provider pages you want rows for:
-   - <https://platform.claude.com/workspaces/default/cost> → `Claude:`
+   - <https://platform.claude.com/cost> → `Claude:`
    - `https://platform.openai.com/settings/<project>/limits` → `OpenAI:`
    - `https://aistudio.google.com/spend?project=<project>` → `Gemini:`
 
