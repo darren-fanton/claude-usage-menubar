@@ -19,8 +19,14 @@
 // while spend is actually accruing. That is Google's reporting delay, not a bug
 // here -- the menu carries a tooltip saying so.
 //
-// DOM scrape rather than an API call: AI Studio talks to a protobuf-over-HTTP
-// `$rpc/...MakerSuiteService` backend, which is not practical to call directly.
+// DOM scrape rather than an API call, and unlike Claude there is no way around it.
+// The cost card is not AI Studio's own data: the page fetches it from
+// `cloudconsole-pa.clients6.google.com/$rpc/...BillingSduiService/GetSdui`, a
+// server-driven-UI protobuf RPC that wants an access token minted by an earlier
+// MakerSuiteService call and a JSPB-encoded request naming the surface, and answers
+// with a UI tree rather than a figure. Google's supported route to actual spend is
+// a BigQuery billing export. So this row keeps its tab, and keeping that tab open
+// is what keeps the row alive.
 
 (() => {
   // Exactly one live timer per tab, and it must belong to the CURRENT extension
