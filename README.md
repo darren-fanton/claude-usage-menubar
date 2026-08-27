@@ -3,13 +3,13 @@
 Surfaces your Claude session and weekly usage limits in your macOS menu bar.
 
 ```
-extension content scripts ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
-  usage.js   → plan usage, any claude.ai tab, 60s                 (bash plugin)
-  cost.js    → Claude console spend                                    │
-  openai.js  → OpenAI project spend                                    │
-  gemini.js  → Gemini billing cost                                     │
-                                                                       │
-Claude OAuth usage API ───────────GET (fallback, ≤1 per 5 min)─────────┘
+extension ────────────────────────POST──▶ localhost:7823 ──GET──▶ SwiftBar
+  background.js → plan usage, no tab needed, 60s              (bash plugin)
+  background.js → Claude console spend, no tab needed, 5min        │
+  openai.js     → OpenAI project spend, scraped from its tab       │
+  gemini.js     → Gemini billing cost, scraped from its tab        │
+                                                                   │
+Claude OAuth usage API ───────GET (fallback, ≤1 per 5 min)─────────┘
 ```
 
 **Usage numbers** have two sources, and the plugin prefers whichever is fresher:
@@ -35,11 +35,11 @@ last good payload is served for up to 30 minutes and the footer is marked `(cach
 **Practical upshot:** keep any claude.ai tab open and you get 60s updates. Close them all
 and it degrades to ~5-minute updates rather than breaking.
 
-**API cost figures** come from per-service content scripts, one row per provider:
+**API cost figures** are collected per service, one row per provider:
 
 | Row | Source | Figure |
 |---|---|---|
-| `Claude:` | `platform.claude.com/cost` | month-to-date total cost (tokens + web search + code execution) |
+| `Claude:` | `platform.claude.com/api/organizations/<org>/current_spend` | month-to-date spend — the `$267.07 spent` figure on [settings/billing](https://platform.claude.com/settings/billing) |
 | `OpenAI:` | `platform.openai.com/settings/*/limits` | current project spend (the `$X` of `$X / $limit`) |
 | `Gemini:` | `aistudio.google.com/**/billing` | month-to-date "Total cost" from the "Billing Account Cost for Gemini API" card |
 
@@ -52,13 +52,16 @@ and it degrades to ~5-minute updates rather than breaking.
 A service may post `null` to mean "no figure yet"; that renders as `-`. Posting `0` means a
 real zero. The distinction matters for any provider whose billing reports on a delay.
 
-Both scrape the rendered page — neither console exposes a JSON endpoint a content script
-can call directly. Each posts only its own key, and the server merges the `cost` object
-per service, so one provider updating never wipes another's figure. Those tabs need to
-stay open, and the extension reloads each of them every 10 minutes. None of the three
-pages repaints its figure after load, and a tab Chromium has frozen runs no scrape timer
-at all, so on a backgrounded browser the reload cycle is what actually produces each
-row's number.
+Claude needs no tab: the service worker calls the console's own cookie-authenticated
+`current_spend` endpoint — the one the billing page itself hits — every 5 minutes. OpenAI
+and Gemini are DOM scrapes, because neither console exposes a JSON endpoint a content
+script can call directly, so those two tabs do need to stay open and the extension
+reloads each of them every 10 minutes. Neither page repaints its figure after load, and a
+tab Chromium has frozen runs no scrape timer at all, so on a backgrounded browser the
+reload cycle is what actually produces those two rows' numbers.
+
+Each source posts only its own key, and the server merges the `cost` object per service,
+so one provider updating never wipes another's figure.
 
 The extension and the local server are optional: without them the menu bar still works
 from the OAuth API alone, just at ~5-minute resolution and with no API Cost rows.
@@ -138,8 +141,10 @@ Skip only if ~5-minute usage updates are fine and you don't want the API Cost ro
 3. Click **Load unpacked** and select the `extension/` folder.
 4. Keep **any** claude.ai tab open — `usage.js` pushes plan usage from there every 60s.
    It does not have to be the usage settings page; any claude.ai page works.
-5. For the API Cost rows, leave open whichever provider pages you want rows for:
-   - <https://platform.claude.com/cost> → `Claude:`
+5. The `Claude:` cost row needs nothing kept open — the extension calls the console API
+   directly, using the session cookie from having signed in to
+   <https://platform.claude.com> in this browser. For the other two rows, leave open
+   whichever provider page you want:
    - `https://platform.openai.com/settings/<project>/limits` → `OpenAI:`
    - `https://aistudio.google.com/u/0/billing` → `Gemini:`
 
@@ -147,8 +152,8 @@ Skip only if ~5-minute usage updates are fine and you don't want the API Cost ro
 verbatim. With several claude.ai tabs open, a `localStorage` lease elects a single poller
 so it stays at one request per minute in total, not one per tab.
 
-`cost.js` posts `cost.claude`, `openai.js` posts `cost.openai`, `gemini.js` posts
-`cost.gemini` — each only its own key.
+`background.js` posts `cost.claude` from the console's `current_spend` endpoint,
+`openai.js` posts `cost.openai`, `gemini.js` posts `cost.gemini` — each only its own key.
 
 `background.js` reloads every scraped tab except `claude.ai` on a 10-minute alarm. Three
 things depend on it: the figures only change at load; a page left open long enough drifts
@@ -315,9 +320,8 @@ claude-usage-menubar/
 ├── README.md
 ├── extension/                          # 60s usage pushes + API Cost rows
 │   ├── manifest.json
-│   ├── background.js                   # retrofits scripts into already-open tabs
+│   ├── background.js                   # polls plan usage + Claude spend; retrofits scripts
 │   ├── usage.js                        # pushes plan usage from any claude.ai tab
-│   ├── cost.js                         # scrapes platform.claude.com spend
 │   ├── openai.js                       # scrapes platform.openai.com project spend
 │   └── gemini.js                       # scrapes AI Studio billing cost
 ├── server/
@@ -335,7 +339,7 @@ claude-usage-menubar/
 
 - **"No Claude Code credentials in keychain"** — the plugin couldn't read the OAuth token. Confirm Claude Code is logged in and that `security find-generic-password -s "Claude Code-credentials" -w` returns JSON.
 - **"Could not reach the usage API"** — the token was found but the call failed. Most often the token expired and Claude Code hasn't refreshed it yet; run any Claude Code command and it renews. Reproduce with the `curl` in §2.
-- **Usage percentages are right but API Cost rows are missing** — that's the extension half. Check the server (`curl http://localhost:7823/usage`) and that a `platform.claude.com/cost` tab is open. Note the payload must use per-service keys (`cost.claude`); the older `cost.totalUSD` shape is ignored.
+- **Usage percentages are right but API Cost rows are missing** — that's the extension half. Check the server (`curl http://localhost:7823/usage`). For `Claude:`, confirm you are signed in to <https://platform.claude.com> in that browser; for the other two, that their tab is open. Note the payload must use per-service keys (`cost.claude`); the older `cost.totalUSD` shape is ignored.
 - **Footer stuck on `(cached)`** — the usage API keeps failing. Usually HTTP 429 from too many calls; raise `USAGE_TTL` in the plugin. Check the live status with the `curl` in §2.
 - **A provider row never appears** — its content script probably isn't running in that tab. `background.js` retrofits scripts into already-open tabs on reload, so a plain extension reload should be enough; if a row is still missing, reload that tab and check `chrome://extensions` for errors on the service worker.
 - **Removing a content script doesn't stop it** — Chromium leaves already-injected scripts running in open tabs, orphaned, until those tabs reload. `background.js` can add scripts to open tabs but cannot remove them.

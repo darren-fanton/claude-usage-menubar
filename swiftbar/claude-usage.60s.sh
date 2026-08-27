@@ -123,11 +123,12 @@ svg_to_b64() {
 
 # --- Cost + pushed usage: read the local server first ---
 # The usage endpoint carries no console spend figure -- its `spend` field is
-# prepaid credits, a different number -- so the API Cost rows still come from
-# cost.js scraping platform.claude.com/cost into the local server. That page only paints
-# its figure at load, so the extension's service worker reloads it -- and every
-# other scraped provider tab -- every 10 min, comfortably inside the
-# COST_STALE_MAX window below.
+# prepaid credits, a different number -- so the API Cost rows come from the
+# extension instead. Claude is fetched by the service worker straight from the
+# console API behind settings/billing ("$267.07 spent") every 5 min and needs no
+# tab; OpenAI and Gemini are still DOM scrapes, and their pages paint their figure
+# once at load, so the worker reloads those tabs every 10 min -- both cadences
+# comfortably inside the COST_STALE_MAX window below.
 COST_JSON=$(curl -fsS --max-time 2 "http://localhost:7823/usage" 2>/dev/null)
 
 # --- Preferred usage source: pushed by the extension ---
@@ -952,7 +953,7 @@ if [ -n "$COST_SERVICES" ]; then
   # in render_codex).
   printf '\xc2\xa0\n'
   # Orange pill title (full-color image; see the Claude header note).
-  echo " | image=$(generate_label_b64 "API Cost" "#f97316") href=\"https://platform.claude.com/cost\""
+  echo " | image=$(generate_label_b64 "API Cost" "#f97316") href=\"https://platform.claude.com/settings/billing\""
   _old_ifs="$IFS"; IFS=';'
   for _svc in $COST_SERVICES; do
     _name="${_svc%%=*}"
@@ -964,11 +965,11 @@ if [ -n "$COST_SERVICES" ]; then
       openai) _label="OpenAI" ;;
       *)      _label="$(printf '%s' "${_name:0:1}" | tr '[:lower:]' '[:upper:]')${_name:1}" ;;
     esac
-    # A warning to the LEFT of the label when THIS provider's scraper has stopped
-    # reporting. Each service is scraped independently, so one going dark (tab
-    # closed, logged out, page markup moved) leaves a stale figure sitting next to
-    # two live ones with nothing to distinguish them. The age is per service --
-    # a single global timestamp could not tell them apart.
+    # A warning to the LEFT of the label when THIS provider has stopped reporting.
+    # Each service is collected independently, so one going dark (tab closed,
+    # logged out, page markup moved) leaves a stale figure sitting next to two live
+    # ones with nothing to distinguish them. The age is per service -- a single
+    # global timestamp could not tell them apart.
     _age=$(cost_age "$_name")
     _warn=""
     if [ -z "$_age" ]; then

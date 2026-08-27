@@ -7,13 +7,13 @@
 Surfaces Claude session and weekly usage limits (and optional Anthropic API costs) in the macOS menu bar via [SwiftBar](https://github.com/swiftbar/SwiftBar).
 
 ```
-extension content scripts ──POST──▶ localhost:7823 ──GET──▶ SwiftBar
-  usage.js   → plan usage, any claude.ai tab, 60s                 (bash plugin)
-  cost.js    → Claude console spend                                    │
-  openai.js  → OpenAI project spend                                    │
-  gemini.js  → Gemini billing cost                                     │
-                                                                       │
-Claude OAuth usage API ───────────GET (fallback, ≤1 per 5 min)─────────┘
+extension ────────────────────────POST──▶ localhost:7823 ──GET──▶ SwiftBar
+  background.js → plan usage, no tab needed, 60s              (bash plugin)
+  background.js → Claude console spend, no tab needed, 5min        │
+  openai.js     → OpenAI project spend, scraped from its tab       │
+  gemini.js     → Gemini billing cost, scraped from its tab        │
+                                                                   │
+Claude OAuth usage API ───────GET (fallback, ≤1 per 5 min)─────────┘
 ```
 
 **Usage** has two sources. `usage.js` runs in any open claude.ai tab and calls claude.ai's
@@ -22,12 +22,14 @@ updates. The OAuth API (`api.anthropic.com`, Claude Code's keychain token) is th
 when no tab is open; it is rate-limited to roughly one call every three minutes across all
 consumers, so it cannot drive a 60s cadence on its own. Both return the same payload shape.
 
-**API cost** is one row per service, scraped by a content script per provider:
-`cost.js` from the Claude console, `openai.js` from the OpenAI project Limits page,
-`gemini.js` from the Google AI Studio Billing page (which Google updates up to 24h late). Each
-posts only its own key and the server merges `cost` per service, so providers never
-overwrite each other. Neither console exposes a JSON endpoint a content script can call,
-so both are DOM scrapes and need their tab left open.
+**API cost** is one row per service. Claude comes from the console's own
+cookie-authenticated `/api/organizations/<org>/current_spend` — the number behind
+"$267.07 spent" on settings/billing — polled by the service worker every 5 min with no tab
+involved. `openai.js` (OpenAI project Limits page) and `gemini.js` (Google AI Studio
+Billing page, which Google updates up to 24h late) are DOM scrapes, because neither of
+those consoles exposes a JSON endpoint a content script can call, so those two need their
+tab left open. Each posts only its own key and the server merges `cost` per service, so
+providers never overwrite each other.
 
 That split matters for install: **the extension and the Node server are needed for
 per-minute usage updates and the API Cost rows.** Without them the menu still works from
@@ -117,8 +119,9 @@ This is a manual step — you can't load an unpacked extension on the user's beh
 1. Open `chrome://extensions` (or the equivalent in Dia/Arc/Brave).
 2. Toggle **Developer mode** in the top right.
 3. Click **Load unpacked** and select the `extension/` folder inside this project.
-4. Open one tab per provider they want a cost row for, and leave each open:
-   - <https://platform.claude.com/cost> → `cost.claude`
+4. `cost.claude` needs no tab — the extension calls the console API with the session
+   cookie from having signed in to <https://platform.claude.com> in that browser. Open one
+   tab per remaining provider they want a cost row for, and leave each open:
    - `https://platform.openai.com/settings/<project>/limits` → `cost.openai`
    - <https://aistudio.google.com/u/0/billing> → `cost.gemini`
 
@@ -201,7 +204,7 @@ Claude: $101.42
 Last Updated: 2 min ago
 ```
 
-(The cost block only appears if the user opened `platform.claude.com/cost` and the cost-scraper script ran.)
+(The cost block only appears once something has posted a `cost.*` key — the extension loaded and signed in to the console, and whichever provider tabs they opened.)
 
 ## Project layout
 
@@ -211,12 +214,10 @@ claude-usage-menubar/
 ├── README.md                             # original / longform reference
 ├── extension/
 │   ├── manifest.json
-│   ├── background.js                     # retrofits scripts into already-open tabs
+│   ├── background.js                     # polls plan usage + Claude spend; retrofits scripts
 │   ├── usage.js                          # pushes plan usage from any claude.ai tab
 │   ├── openai.js                         # scrapes OpenAI project spend
 │   ├── gemini.js                         # scrapes AI Studio billing cost
-│   ├── cost.js                           # scrapes console month-to-date spend
-│   ├── cost.js                           # scrapes platform.claude.com cost page
 │   └── icons/
 ├── server/
 │   ├── server.js                         # the Node server itself

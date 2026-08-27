@@ -15,12 +15,19 @@
 
 (() => {
   // Exactly one live timer per tab, and it must belong to the CURRENT extension
-  // context. background.js re-injects into open tabs on every extension reload, but
-  // the isolated world holding this registry outlives that reload -- so a plain
-  // "already ran, bail out" flag turned re-injection into a no-op that deferred to
-  // a timer whose context had just been torn down and could no longer reach the
-  // server. Holding the timer ids makes re-injection a replacement instead. See
-  // cost.js for the full account.
+  // context.
+  //
+  // background.js re-injects into open tabs whenever the extension reloads, and the
+  // isolated world -- this registry with it -- outlives that reload; only a page
+  // navigation clears it. So a plain "already ran, bail out" flag made every
+  // re-injection a no-op, deferring to a timer whose extension context had just
+  // been torn down and which could no longer reach the server. Silent by
+  // construction: reloading the extension killed this scraper until someone
+  // reloaded the tab by hand, and the menu just showed a stale figure.
+  //
+  // Holding the timer ids instead of a boolean makes re-injection a REPLACEMENT --
+  // cancel what the previous injection left running, then arm our own. Still one
+  // timer, so the double-POST the old guard existed to prevent stays prevented.
   const _reg = (globalThis.__claudeUsageMenubar ||= {});
   if (_reg.openai) {
     clearTimeout(_reg.openai.first);

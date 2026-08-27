@@ -25,7 +25,7 @@
   // "already ran, bail out" flag turned re-injection into a no-op that deferred to
   // a timer whose context had just been torn down and could no longer reach the
   // server. Holding the timer id makes re-injection a replacement instead. See
-  // cost.js for the full account.
+  // openai.js for the full account.
   const _reg = (globalThis.__claudeUsageMenubar ||= {});
   if (_reg.usage) clearInterval(_reg.usage.poll);
 
